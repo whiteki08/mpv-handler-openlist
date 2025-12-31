@@ -1,336 +1,254 @@
-// mpv-handler.go
 package main
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"golang.org/x/sys/windows/registry"
 	"gopkg.in/ini.v1"
 )
 
-// Config holds external settings loaded/saved via ini
-type Config struct {
-	MpvPath        string
-	EnableLog      bool
-	LogPath        string
-	UserAgentMap   map[string]string
-	SchemeProfiles map[string]string // scheme -> profile name
+// ==========================================
+// 1. 数据结构定义 (Data Structures)
+// ==========================================
+
+// Payload 定义了前端传来的标准指令格式
+// 扩展性：未来如果需要传字幕、起始时间、音轨，只需在这里加字段
+type Payload struct {
+	Target   string `json:"mode"`               // 目标播放器: mpv, potplayer
+	Url      string `json:"url"`                // 视频地址
+	Profile  string `json:"profile,omitempty"`  // MPV 专用: profile 名称
+	Geometry string `json:"geometry,omitempty"` // MPV 专用: 窗口位置 (50%x50%+0+0)
+	Title    string `json:"title,omitempty"`    // 通用: 窗口标题
+	Sub      string `json:"sub,omitempty"`      // 通用: 字幕文件 URL
 }
 
-// iniPathForExe returns "<exeBase>.ini" in exe dir
+// Config 定义了本地配置文件的结构
+type Config struct {
+	MpvPath   string
+	PotPath   string
+	EnableLog bool
+	LogPath   string
+}
+
+// PlayerHandler 是一个函数类型，用于将通用 Payload 转换为具体播放器的 exec.Cmd
+type PlayerHandler func(binPath string, p *Payload) *exec.Cmd
+
+// ==========================================
+// 2. 扩展核心：播放器处理器注册表
+// ==========================================
+
+// Handlers 映射表：将 "mode" 字符串映射到具体的构建逻辑
+// 扩展性：想加 VLC？只需在这里加一行 "vlc": buildVlcCmd，然后在下面写实现函数即可
+var Handlers = map[string]PlayerHandler{
+	"mpv":       buildMpvCmd,
+	"potplayer": buildPotPlayerCmd,
+}
+
+// buildMpvCmd 负责构建 MPV 的复杂参数
+func buildMpvCmd(binPath string, p *Payload) *exec.Cmd {
+	args := []string{p.Url}
+
+	// 动态参数注入
+	if p.Profile != "" {
+		args = append(args, "--profile="+p.Profile)
+	}
+	if p.Geometry != "" {
+		args = append(args, "--geometry="+p.Geometry)
+	}
+	if p.Title != "" {
+		args = append(args, "--force-media-title="+p.Title)
+	}
+	if p.Sub != "" {
+		args = append(args, "--sub-file="+p.Sub)
+	}
+
+	// 强制为了 Video Wall 优化的参数 (可选，防止多开时的焦点抢占问题)
+	// args = append(args, "--ontop") 
+
+	return exec.Command(binPath, args...)
+}
+
+// buildPotPlayerCmd 负责构建 PotPlayer 的参数
+func buildPotPlayerCmd(binPath string, p *Payload) *exec.Cmd {
+	// PotPlayer 命令行相对简单，主要传 URL
+	// 注意：PotPlayer 对 Title 和 Geometry 的命令行支持不如 MPV 完善
+	args := []string{p.Url}
+	return exec.Command(binPath, args...)
+}
+
+// ==========================================
+// 3. 工具函数 (Utils)
+// ==========================================
+
 func iniPathForExe(exe string) string {
 	dir := filepath.Dir(exe)
 	base := strings.TrimSuffix(filepath.Base(exe), filepath.Ext(exe))
 	return filepath.Join(dir, base+".ini")
 }
 
-// loadConfig reads the configuration file from the executable's directory.
-func loadConfig() (*Config, error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return nil, fmt.Errorf("could not determine executable path: %w", err)
-	}
+func loadConfig() *Config {
+	exe, _ := os.Executable()
+	defaultLog := filepath.Join(filepath.Dir(exe), "mpv-handler.log")
+	cfg := &Config{EnableLog: true, LogPath: defaultLog}
+
 	iniPath := iniPathForExe(exe)
-
-	defaultLogPath := filepath.Join(filepath.Dir(exe), "mpv-handler.log")
-	defaultConfig := &Config{
-		MpvPath:        "",
-		EnableLog:      false,
-		LogPath:        defaultLogPath,
-		UserAgentMap:   make(map[string]string),
-		SchemeProfiles: map[string]string{"mpv": "multi", "mpv-cinema": "cinema"},
+	f, err := ini.Load(iniPath)
+	if err == nil {
+		sec := f.Section("players")
+		cfg.MpvPath = sec.Key("mpv").String()
+		cfg.PotPath = sec.Key("potplayer").String()
+		
+		secLog := f.Section("config")
+		cfg.EnableLog = secLog.Key("log").MustBool(true)
 	}
-
-	loadOpts := ini.LoadOptions{
-		Insensitive:         true,
-		IgnoreInlineComment: true,
-	}
-
-	cfgFile, err := ini.LoadSources(loadOpts, iniPath)
-	if err != nil {
-		// No ini yet -> return defaults
-		return defaultConfig, nil
-	}
-
-	sec := cfgFile.Section("mpv-handler")
-	defaultConfig.MpvPath = sec.Key("mpvPath").MustString("")
-	defaultConfig.EnableLog = sec.Key("enableLog").MustBool(false)
-	defaultConfig.LogPath = sec.Key("logPath").MustString(defaultLogPath)
-
-	secUserAgents := cfgFile.Section("UserAgents")
-	if secUserAgents != nil {
-		defaultConfig.UserAgentMap = secUserAgents.KeysHash()
-	}
-
-	secSchemes := cfgFile.Section("Schemes")
-	if secSchemes != nil {
-		for _, k := range secSchemes.Keys() {
-			// e.g. mpv=multi, mpv-cinema=cinema
-			defaultConfig.SchemeProfiles[strings.TrimSpace(k.Name())] = strings.TrimSpace(k.Value())
-		}
-	}
-
-	return defaultConfig, nil
+	return cfg
 }
 
-// saveConfig writes config back to ini, preserving format where possible.
-func saveConfig(cfg *Config) error {
-	exe, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("could not determine executable path: %w", err)
-	}
-	iniPath := iniPathForExe(exe)
-
-	loadOpts := ini.LoadOptions{
-		Insensitive:         true,
-		IgnoreInlineComment: true,
-	}
-	file, err := ini.LoadSources(loadOpts, iniPath)
-	if err != nil {
-		file = ini.Empty()
-	}
-
-	sec, _ := file.GetSection("mpv-handler")
-	if sec == nil {
-		sec, _ = file.NewSection("mpv-handler")
-	}
-	sec.Key("mpvPath").SetValue(cfg.MpvPath)
-	sec.Key("enableLog").SetValue(fmt.Sprintf("%v", cfg.EnableLog))
-	sec.Key("logPath").SetValue(cfg.LogPath)
-
-	file.DeleteSection("UserAgents")
-	uaSec, _ := file.NewSection("UserAgents")
-	for pattern, ua := range cfg.UserAgentMap {
-		uaSec.Key(pattern).SetValue(ua)
-	}
-
-	file.DeleteSection("Schemes")
-	sSec, _ := file.NewSection("Schemes")
-	for scheme, profile := range cfg.SchemeProfiles {
-		sSec.Key(scheme).SetValue(profile)
-	}
-
-	return file.SaveTo(iniPath)
-}
-
-// writeLog appends a message if enabled
-func writeLog(enable bool, logPath, msg string) {
-	if !enable {
+func writeLog(cfg *Config, msg string) {
+	if !cfg.EnableLog {
 		return
 	}
-	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(cfg.LogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err == nil {
+		defer f.Close()
+		ts := time.Now().Format("2006-01-02 15:04:05")
+		f.WriteString(fmt.Sprintf("%s | %s\n", ts, msg))
+	}
+}
+
+// parsePayload 解析 jelly-player://<Base64> 协议
+func parsePayload(rawURI string) (*Payload, error) {
+	prefix := "jelly-player://"
+	if !strings.HasPrefix(rawURI, prefix) {
+		return nil, fmt.Errorf("invalid scheme, must start with %s", prefix)
+	}
+
+	b64Str := strings.TrimPrefix(rawURI, prefix)
+	
+	// 处理 URL Safe Base64 字符替换
+	b64Str = strings.ReplaceAll(b64Str, "-", "+")
+	b64Str = strings.ReplaceAll(b64Str, "_", "/")
+	
+	// 处理 Padding (Base64 长度必须是 4 的倍数)
+	if mod := len(b64Str) % 4; mod != 0 {
+		b64Str += strings.Repeat("=", 4-mod)
+	}
+
+	data, err := base64.StdEncoding.DecodeString(b64Str)
 	if err != nil {
+		return nil, fmt.Errorf("base64 decode error: %w", err)
+	}
+
+	var p Payload
+	if err := json.Unmarshal(data, &p); err != nil {
+		return nil, fmt.Errorf("json unmarshal error: %w", err)
+	}
+	return &p, nil
+}
+
+// ==========================================
+// 4. 注册表操作 (Installer)
+// ==========================================
+
+func install(exePath string) {
+	scheme := "jelly-player"
+	k, _, err := registry.CreateKey(registry.CLASSES_ROOT, scheme, registry.SET_VALUE)
+	if err != nil {
+		fmt.Printf("Error creating key: %v\n", err)
 		return
 	}
-	defer f.Close()
-	line := fmt.Sprintf("%s | %s\n", time.Now().Format("2006-01-02 15:04:05"), msg)
-	_, _ = f.WriteString(line)
+	defer k.Close()
+
+	k.SetStringValue("", "URL:Jellyfin External Player Protocol")
+	k.SetStringValue("URL Protocol", "")
+
+	// Icon
+	ik, _, _ := registry.CreateKey(k, "DefaultIcon", registry.SET_VALUE)
+	ik.SetStringValue("", fmt.Sprintf("%s,0", exePath))
+	ik.Close()
+
+	// Command
+	ck, _, err := registry.CreateKey(k, `shell\open\command`, registry.SET_VALUE)
+	if err != nil {
+		fmt.Printf("Error creating command key: %v\n", err)
+		return
+	}
+	defer ck.Close()
+
+	ck.SetStringValue("", fmt.Sprintf("\"%s\" \"%%1\"", exePath))
+	fmt.Printf("Successfully registered protocol: %s://\n", scheme)
 }
 
-// installProtocol registers a custom URL scheme
-func installProtocol(scheme, exePath string) error {
-	key, _, err := registry.CreateKey(registry.CLASSES_ROOT, scheme, registry.SET_VALUE)
-	if err != nil {
-		return err
-	}
-	defer key.Close()
-
-	key.SetStringValue("", "URL:"+strings.ToUpper(scheme)+" Protocol")
-	key.SetStringValue("URL Protocol", "")
-
-	iconKey, _, err := registry.CreateKey(key, `DefaultIcon`, registry.SET_VALUE)
-	if err != nil {
-		return err
-	}
-	defer iconKey.Close()
-	iconKey.SetStringValue("", exePath+",0")
-
-	cmdKey, _, err := registry.CreateKey(key, `shell\open\command`, registry.SET_VALUE)
-	if err != nil {
-		return err
-	}
-	defer cmdKey.Close()
-	// "%1" is the full URL
-	cmdKey.SetStringValue("", fmt.Sprintf("\"%s\" \"%%1\"", exePath))
-	return nil
-}
-
-// uninstallProtocol removes a custom URL scheme
-func uninstallProtocol(scheme string) error {
-	keysToDelete := []string{
-		fmt.Sprintf(`%s\shell\open\command`, scheme),
-		fmt.Sprintf(`%s\shell\open`, scheme),
-		fmt.Sprintf(`%s\shell`, scheme),
-		fmt.Sprintf(`%s\DefaultIcon`, scheme),
-		scheme,
-	}
-	for _, keyPath := range keysToDelete {
-		err := registry.DeleteKey(registry.CLASSES_ROOT, keyPath)
-		if err != nil && err != syscall.ENOENT {
-			return fmt.Errorf("failed to delete registry key %q: %w", keyPath, err)
-		}
-	}
-	return nil
-}
-
-// extractSchemeAndPayload returns (scheme, payload) from "scheme://payload"
-// IMPORTANT: Do NOT use url.Parse here. For links like
-//   mpv://https%3A%2F%2Fexample.com%2Fvideo.mkv
-// net/url will treat the payload as host(authority) and reject '%' as invalid host encoding.
-func extractSchemeAndPayload(raw string) (string, string, error) {
-	const sep = "://"
-	i := strings.Index(raw, sep)
-	if i <= 0 {
-		return "", "", fmt.Errorf("invalid url: %s", raw)
-	}
-	scheme := raw[:i]
-	payload := raw[i+len(sep):]
-	if strings.TrimSpace(scheme) == "" || strings.TrimSpace(payload) == "" {
-		return "", "", fmt.Errorf("invalid url: %s", raw)
-	}
-	return scheme, payload, nil
-}
-
-// handleURL processes the URL and launches mpv with profile + UA + URL
-func handleURL(raw string, cfg *Config) error {
-	writeLog(cfg.EnableLog, cfg.LogPath, fmt.Sprintf("Raw URL: %s", raw))
-
-	scheme, payload, err := extractSchemeAndPayload(raw)
-	if err != nil {
-		writeLog(cfg.EnableLog, cfg.LogPath, "Invalid scheme/url: "+err.Error())
-		return err
-	}
-	writeLog(cfg.EnableLog, cfg.LogPath, fmt.Sprintf("Scheme: %s", scheme))
-	writeLog(cfg.EnableLog, cfg.LogPath, fmt.Sprintf("Payload: %s", payload))
-
-	decoded, err := url.QueryUnescape(payload)
-	if err != nil {
-		writeLog(cfg.EnableLog, cfg.LogPath, fmt.Sprintf("Decode error: %v", err))
-		return err
-	}
-
-	// 防止浏览器/handler 在末尾误带 "/"（有时甚至是多段 "////"）
-	decoded = strings.Trim(decoded, "/")
-
-	writeLog(cfg.EnableLog, cfg.LogPath, fmt.Sprintf("Decoded URL: %s", decoded))
-
-	if _, err := os.Stat(cfg.MpvPath); err != nil {
-		writeLog(cfg.EnableLog, cfg.LogPath, "mpv not found at: "+cfg.MpvPath)
-		return err
-	}
-
-	args := []string{}
-
-	// scheme -> profile
-	if profile, ok := cfg.SchemeProfiles[scheme]; ok && strings.TrimSpace(profile) != "" {
-		args = append(args, "--profile="+profile)
-		writeLog(cfg.EnableLog, cfg.LogPath, fmt.Sprintf("Using profile: %s", profile))
-	}
-
-	// user-agent mapping based on URL path
-	userAgent := ""
-	parsedURL, err := url.Parse(decoded)
-	if err == nil && parsedURL.Path != "" {
-		for pathPattern, ua := range cfg.UserAgentMap {
-			if strings.Contains(parsedURL.Path, pathPattern) {
-				userAgent = ua
-				writeLog(cfg.EnableLog, cfg.LogPath, fmt.Sprintf("Found matching UA for pattern '%s'. Using UA: %s", pathPattern, userAgent))
-				break
-			}
-		}
-	} else {
-		// 不致命：URL parse 失败也照样可播放
-		writeLog(cfg.EnableLog, cfg.LogPath, "Could not parse decoded URL for UA matching; continuing.")
-	}
-
-	if userAgent != "" {
-		args = append(args, "--user-agent="+userAgent)
-	}
-
-	args = append(args, decoded)
-	writeLog(cfg.EnableLog, cfg.LogPath, fmt.Sprintf("Executing: %s %s", cfg.MpvPath, strings.Join(args, " ")))
-	return exec.Command(cfg.MpvPath, args...).Start()
-}
+// ==========================================
+// 5. 主程序入口 (Main)
+// ==========================================
 
 func main() {
-	exe, err := os.Executable()
+	exe, _ := os.Executable()
+	cfg := loadConfig()
+
+	// 没有任何参数时显示帮助
+	if len(os.Args) < 2 {
+		fmt.Println("Jellyfin Universal Handler")
+		fmt.Println("Usage: mpv-handler.exe --install")
+		fmt.Println("Usage: jelly-player://<Base64_Payload>")
+		return
+	}
+
+	arg := os.Args[1]
+
+	// 1. 安装模式
+	if arg == "--install" {
+		install(exe)
+		return
+	}
+
+	// 2. 运行模式 (处理协议)
+	p, err := parsePayload(arg)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "Error getting executable path:", err)
-		os.Exit(1)
+		writeLog(cfg, "Protocol Error: "+err.Error())
+		return
 	}
 
-	cfg, err := loadConfig()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Error loading configuration:", err)
-		os.Exit(1)
+	// 记录接收到的原始指令
+	jsonBytes, _ := json.Marshal(p)
+	writeLog(cfg, fmt.Sprintf("Received Payload: %s", string(jsonBytes)))
+
+	// 3. 寻找播放器路径
+	var binPath string
+	switch p.Target {
+	case "mpv":
+		binPath = cfg.MpvPath
+	case "potplayer":
+		binPath = cfg.PotPath
+	default:
+		writeLog(cfg, "Unknown Target Mode: "+p.Target)
+		return
 	}
 
-	// CLI
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "--install":
-			// Usage:
-			// mpv-handler --install --scheme mpv "F:\MPV\mpv-lazy\mpv.exe"
-			if len(os.Args) != 5 || os.Args[2] != "--scheme" {
-				fmt.Fprintln(os.Stderr, "Usage: mpv-handler --install --scheme <scheme> \"<path-to-mpv.exe>\"")
-				os.Exit(1)
-			}
-			scheme := os.Args[3]
-			mpvPath := os.Args[4]
-			if _, err := os.Stat(mpvPath); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: mpv.exe not found at the specified path: %s\n", mpvPath)
-				os.Exit(1)
-			}
-			cfg.MpvPath = mpvPath
-			// 如果 ini 没写 Schemes，就保留默认 mpv=multi / mpv-cinema=cinema
-			if err := saveConfig(cfg); err != nil {
-				fmt.Fprintln(os.Stderr, "Failed to save config:", err)
-				os.Exit(1)
-			}
-			if err := installProtocol(scheme, exe); err != nil {
-				fmt.Fprintln(os.Stderr, "Install failed:", err)
-				os.Exit(1)
-			}
-			fmt.Println("Protocol installed:", scheme)
-			return
-
-		case "--uninstall":
-			// Usage:
-			// mpv-handler --uninstall --scheme mpv
-			if len(os.Args) != 4 || os.Args[2] != "--scheme" {
-				fmt.Fprintln(os.Stderr, "Usage: mpv-handler --uninstall --scheme <scheme>")
-				os.Exit(1)
-			}
-			scheme := os.Args[3]
-			if err := uninstallProtocol(scheme); err != nil {
-				fmt.Fprintln(os.Stderr, "Uninstall failed:", err)
-				os.Exit(1)
-			}
-			fmt.Println("Protocol uninstalled:", scheme)
-			return
-
-		default:
-			// Treat as URL
-			if err := handleURL(os.Args[1], cfg); err != nil {
-				os.Exit(2)
-			}
-			return
-		}
+	if binPath == "" {
+		writeLog(cfg, fmt.Sprintf("Path not configured for mode: %s", p.Target))
+		return
 	}
 
-	fmt.Println("mpv-handler: A protocol handler for mpv.")
-	fmt.Println("Usage:")
-	fmt.Println("  mpv-handler --install --scheme <scheme> \"<full-path-to-mpv.exe>\"")
-	fmt.Println("  mpv-handler --uninstall --scheme <scheme>")
-	fmt.Println("\nExample:")
-	fmt.Println("  mpv-handler --install --scheme mpv \"F:\\MPV\\mpv-lazy\\mpv.exe\"")
-	fmt.Println("  mpv-handler --install --scheme mpv-cinema \"F:\\MPV\\mpv-lazy\\mpv.exe\"")
-	fmt.Println("\nConfig stored in <exeName>.ini next to the executable.")
+	// 4. 调度执行 (Factory Dispatch)
+	handler, ok := Handlers[p.Target]
+	if !ok {
+		writeLog(cfg, "No handler implementation for: "+p.Target)
+		return
+	}
+
+	cmd := handler(binPath, p)
+	writeLog(cfg, fmt.Sprintf("Executing: %s %v", cmd.Path, cmd.Args))
+
+	if err := cmd.Start(); err != nil {
+		writeLog(cfg, "Launch Error: "+err.Error())
+	}
 }

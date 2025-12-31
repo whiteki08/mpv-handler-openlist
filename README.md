@@ -1,65 +1,85 @@
-# mpv-handler-openlist
+# English Version
+
+# Jellyfin MPV Desktop Bridge (Fork)
 
 [中文](./README_zh.md)
 
-A URL protocol handler (`mpv://`) for the [mpv](https://mpv.io/) or [mpv.net](https://github.com/mpvnet-player/mpv.net) media players on Windows. This tool is designed to be used with the [OpenList](https://github.com/OpenListTeam/OpenList) web application to open video links in mpv or mpv.net player.
+An advanced bridge tool for local players, heavily refactored from [mpv-handler-openlist](https://github.com/outlook84/mpv-handler-openlist).
 
-## Features
+While this project started as a fork, it has evolved into a completely new beast. We have replaced the basic URL handling with a powerful **Universal Jelly-Player Schema**, designed specifically to bring a **desktop-class multi-window concurrent playback experience** to Jellyfin/Emby Web clients.
 
-- **`mpv://` Protocol**: Handles `mpv://` URLs to open videos in mpv or mpv.net.
-- **Easy Setup**: Simple command-line installation and uninstallation.
-- **Configurable**: The path to `mpv.exe` or `mpvnet.exe` is configurable.
-- **Logging**: Optional logging for troubleshooting.
-- **Custom User-Agent**: Allows setting custom User-Agents for specific URL paths.
+## Key Innovations
+
+1. **Universal Protocol Architecture**
+* Replaced the legacy `mpv://` with the versatile `jelly-player://` protocol.
+* **JSON Payload**: Transmits complex metadata via Base64-encoded JSON, including window geometry, subtitles, MPV profiles, and titles.
+
+
+2. **Batch Concurrent Processing**
+* **Bypassing Browser Limits**: The frontend sends a single array payload containing multiple video instructions.
+* **Instant Launch**: The Go backend parses the batch and launches 4+ MPV processes simultaneously, completely avoiding browser popup blockers and focus-stealing issues.
+
+
+3. **Smart Video Wall**
+* **Pixel-Perfect Layout**: Works with the companion UserScript to calculate physical pixel coordinates based on OS DPI.
+* **Immersive Experience**: Supports full-screen 2x2 grids that cover the taskbar, or work-area aware layouts.
+* **Auto-Subtitles**: Automatically fetches external subtitle URLs from the Jellyfin API and passes them to MPV.
+
+
+4. **Full-Stack Integration**
+* This is not just a handler; it's a system comprising a **Go Backend** and a **Frontend UserScript**.
+
+
 
 ## Installation
 
-1.  **Download**: Go to the [Releases page](https://github.com/outlook84/mpv-handler-openlist/releases) and download the latest `mpv-handler.exe`.
-2.  **Place Executable**: Move `mpv-handler.exe` to a permanent location on your computer (e.g., inside your mpv or mpv.net folder).
-3.  **Register Protocol**: Open a Command Prompt or PowerShell **as an administrator** in the directory where you placed the executable and run the following command. **Remember to replace the path with the actual path to your `mpv.exe` or `mpvnet.exe`**.
+### Step 1: Deploy Backend
 
-    ```shell
-    .\mpv-handler.exe --install "C:\path\to\your\mpv.exe"
-    ```
-
-    If successful, you will see the message "Protocol installed and mpv path saved." A configuration file named `mpv-handler.ini` will also be created in the same directory.
-
-## Usage
-
-Once installed, simply click the `mpv` icon on the [OpenList](https://github.com/OpenListTeam/OpenList) web video playback page, and it will automatically call the player to play the current video.
-
-## Uninstallation
-
-To remove the URL protocol from your system, open a Command Prompt or PowerShell **as an administrator** in the tool's directory and run:
-
+1. Download `mpv-handler.exe` from Releases.
+2. Place it in a permanent folder (e.g., inside your MPV folder).
+3. Run CMD/PowerShell as Administrator and execute:
 ```shell
-.\mpv-handler.exe --uninstall
+.\mpv-handler.exe --install "D:\Path\To\Your\mpv.exe"
+
 ```
 
-## Configuration
 
-The tool uses a configuration file named `mpv-handler.ini`, located in the same directory as the executable.
+*This registers the `jelly-player://` protocol.*
+
+### Step 2: Configure MPV (Critical)
+
+To achieve the seamless video wall effect, add this to your MPV `portable_config/profiles.conf`:
 
 ```ini
-[mpv-handler]
-mpvPath   = C:\path\to\your\mpv.exe
-enableLog = false
-logPath   = mpv-handler.log
-[UserAgents]
-aaa/bbb = "pan.baidu.com"
-bbb/ccc = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0"
+[multi]
+profile-desc=Jellyfin Video Wall
+# Disable snapping and borders for seamless tiling
+snap-window=no
+border=no
+ontop=yes
+# Disable auto-fit, obey frontend geometry strictly
+autofit=no
+keepaspect-window=no
+# Optimization
+osc=no
+osd-level=0
+force-window=immediate
+
 ```
 
-- `mpvPath`: Path to mpv.exe or mpvnet.exe
-- `enableLog`: Set to true to enable logging
-- `logPath`: Path for the log file
+### Step 3: Install UserScript
 
+1. Install Tampermonkey in your browser.
+2. Install `script.js` found in the root of this repo.
+3. Edit the script configuration to match your **Windows Scaling** (e.g., `osScale: 2.0`).
+4. Refresh Jellyfin, select multiple videos, and click **"Grid Play"**.
 
-### Custom User-Agent
+## Protocol Specification
 
-You can specify a custom User-Agent for video sources under specific paths.
+Protocol: `jelly-player://<Base64_Safe_URL_Encoded_JSON>`
 
-The key is a path prefix that will be matched against the part of the URL after `/d/`. For example, for the URL `https://.../d/aaa/bbb/ccc`, the path used for matching is `aaa` or `aaa/bbb/ccc`.
+Advanced users can utilize this schema to drive MPV from other web apps. The payload supports both single objects and arrays (for batch execution).
 
-## License
-This project is licensed under the GNU General Public License v2.0. See the [LICENSE](./LICENSE) file for details.
+## Credits
+
+Forked from [mpv-handler-openlist](https://github.com/outlook84/mpv-handler-openlist). We pay tribute to the original author for providing the solid foundation that made this advanced innovation possible.

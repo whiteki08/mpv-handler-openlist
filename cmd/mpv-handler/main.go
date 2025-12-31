@@ -131,24 +131,45 @@ func parsePayload(rawURI string) (*Payload, error) {
 	}
 
 	b64Str := strings.TrimPrefix(rawURI, prefix)
+
+	// 【核心修复】
+	// 前端 JS使用的是: btoa(...).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+	// 这对应 Go 中的: base64.RawURLEncoding (URL-Safe, No Padding)
+	// 直接用它解码，既不需要手动 replace，也不需要手动加 padding，极其稳健。
 	
-	// 处理 URL Safe Base64 字符替换
-	b64Str = strings.ReplaceAll(b64Str, "-", "+")
-	b64Str = strings.ReplaceAll(b64Str, "_", "/")
+	var data []byte
+	var err error
+
+	// 优先尝试 RawURLEncoding (最匹配前端)
+	data, err = base64.RawURLEncoding.DecodeString(b64Str)
 	
-	// 处理 Padding (Base64 长度必须是 4 的倍数)
-	if mod := len(b64Str) % 4; mod != 0 {
-		b64Str += strings.Repeat("=", 4-mod)
+	// 容错：如果失败，尝试一下标准 RawStdEncoding (防止前端发过来的是未替换符号的 Base64)
+	if err != nil {
+		data, err = base64.RawStdEncoding.DecodeString(b64Str)
+	}
+	
+	// 如果还失败，尝试带 Padding 的标准解码 (防止前端把 padding 加回来了)
+	if err != nil {
+		// 补全 padding 的笨办法，作为最后一道防线
+		if m := len(b64Str) % 4; m != 0 {
+			b64Str += strings.Repeat("=", 4-m)
+		}
+		data, err = base64.URLEncoding.DecodeString(b64Str)
 	}
 
-	data, err := base64.StdEncoding.DecodeString(b64Str)
 	if err != nil {
 		return nil, fmt.Errorf("base64 decode error: %w", err)
 	}
 
+	// 【防御性编程】去除可能存在的首尾不可见字符（如 \x0f, \0 等）
+	// 这能解决 invalid character '\x0f' after top-level value
+	jsonStr := strings.TrimSpace(string(data))
+	jsonStr = strings.Trim(jsonStr, "\x00\x0f") 
+
 	var p Payload
-	if err := json.Unmarshal(data, &p); err != nil {
-		return nil, fmt.Errorf("json unmarshal error: %w", err)
+	if err := json.Unmarshal([]byte(jsonStr), &p); err != nil {
+		// 打印一下解析出来的字符串，方便调试（仅在日志开启时）
+		return nil, fmt.Errorf("json error: %w | Data: %s", err, jsonStr)
 	}
 	return &p, nil
 }

@@ -133,46 +133,51 @@ func parsePayload(rawURI string) (*Payload, error) {
 	// 去除前缀
 	rawStr := strings.TrimPrefix(rawURI, prefix)
 
-	// 【暴力清洗逻辑】
-	// 不依赖 ReplaceAll，而是逐个字符重建字符串。
-	// 1. 扔掉所有不可见字符、空格、引号、垃圾符号。
-	// 2. 将 URL-Safe 的 '-' 和 '_' 强转为 '+' 和 '/'。
+	// 【精准清洗逻辑】
+	// 前端 JS 发送的是 URL-Safe Base64，这意味着有效数据里：
+	// 1. 只有 '-'，没有 '+'
+	// 2. 只有 '_', 没有 '/' (关键点！)
+	// 因此，如果我们读到了 '/'，那绝对是 Windows/浏览器在 URL 末尾画蛇添足加的斜杠，必须扔掉。
 	
 	var cleanBuilder strings.Builder
 	for _, r := range rawStr {
 		switch {
-		// 合法字符直接保留
-		case r >= 'A' && r <= 'Z':
-			cleanBuilder.WriteRune(r)
-		case r >= 'a' && r <= 'z':
-			cleanBuilder.WriteRune(r)
-		case r >= '0' && r <= '9':
+		// 1. 保留标准字母数字
+		case (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
 			cleanBuilder.WriteRune(r)
 		
-		// 变体字符：强制标准化
-		case r == '+' || r == '-':
+		// 2. 归一化 '+' 和 '-' 为 '+'
+		case r == '-' || r == '+':
 			cleanBuilder.WriteRune('+')
-		case r == '/' || r == '_':
-			cleanBuilder.WriteRune('/')
 		
-		// 这里的 default 分支就是“垃圾桶”
-		// 任何空格、换行、引号、%号、NULL 都会被丢弃，不会进入解码器
+		// 3. 归一化 '_' 为 '/' (这是 JS 发来的有效数据)
+		case r == '_':
+			cleanBuilder.WriteRune('/')
+
+		// 4. 【关键】遇到 '/' 直接丢弃
+		// 因为 JS 会把数据里的 slash 转为 underscore。
+		// 所以这里的 slash 只能是系统加的尾部路径符，或者是用户复制粘贴时的误触。
+		case r == '/':
+			continue
+		
+		// 5. 其他字符(空格、引号等)全部丢弃
 		}
 	}
 	cleanStr := cleanBuilder.String()
 
-	// 补全 Padding ('=')
+	// 补全 Padding
 	if m := len(cleanStr) % 4; m != 0 {
 		cleanStr += strings.Repeat("=", 4-m)
 	}
 
-	// 此时 cleanStr 只有纯净的 Standard Base64，绝无报错可能
+	// 解码
 	data, err := base64.StdEncoding.DecodeString(cleanStr)
 	if err != nil {
-		return nil, fmt.Errorf("base64 decode error: %w | CleanStr: %s", err, cleanStr)
+		// 把 cleanStr 打印出来，如果还报错，一眼就能看出是不是还有怪东西
+		return nil, fmt.Errorf("base64 decode error: %w | Raw: %s | Clean: %s", err, rawStr, cleanStr)
 	}
 
-	// JSON 清洗（防止 JSON 内部的控制字符）
+	// JSON 清洗
 	jsonStr := strings.TrimSpace(string(data))
 	jsonStr = strings.Trim(jsonStr, "\x00\x0f")
 

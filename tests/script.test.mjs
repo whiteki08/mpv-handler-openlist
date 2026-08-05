@@ -5,7 +5,7 @@ import vm from "node:vm";
 
 const source = readFileSync(new URL("../script.js", import.meta.url), "utf8");
 
-function loadHelpers(apiClient = {}) {
+function loadHelpers(apiClient = {}, documentValue = {}, windowOverrides = {}) {
   const context = {
     __JFP_TEST__: true,
     TextEncoder,
@@ -24,8 +24,9 @@ function loadHelpers(apiClient = {}) {
       screen: { width: 3840, height: 2160 },
       setTimeout,
       requestAnimationFrame() {},
+      ...windowOverrides,
     },
-    document: {},
+    document: documentValue,
   };
   context.globalThis = context;
   vm.runInNewContext(source, context, { filename: "script.js" });
@@ -167,6 +168,349 @@ test("page cards are read from div.card in DOM order and deduplicated", () => {
 
   assert.deepEqual(Array.from(helpers.getPageCardIds(root)), ["a", "b", "c"]);
   assert.deepEqual(Array.from(helpers.getPageCards(root), card => card.id), ["a", "b", "c"]);
+});
+
+test("page cards ignore hidden person cards and non-video cards", () => {
+  const helpers = loadHelpers();
+  const makeCard = ({ id, type = "Movie", mediaType = "Video", visible = true, ariaHidden = null, className = "card" }) => ({
+    className,
+    hidden: false,
+    parentElement: null,
+    getAttribute(name) {
+      return {
+        "data-id": id,
+        "data-type": type,
+        "data-mediatype": mediaType,
+        "aria-hidden": ariaHidden,
+      }[name] ?? null;
+    },
+    getBoundingClientRect() {
+      return visible ? { width: 200, height: 300 } : { width: 0, height: 0 };
+    },
+    matches(selector) {
+      return selector.includes(".personCard") && className.includes("personCard");
+    },
+  });
+  const root = {
+    querySelectorAll(selector) {
+      assert.equal(selector, "div.card[data-id]");
+      return [
+        makeCard({ id: "actor", type: "Actor", className: "card personCard" }),
+        makeCard({ id: "hidden", visible: false }),
+        makeCard({ id: "aria-hidden", ariaHidden: "true" }),
+        makeCard({ id: "movie-1" }),
+        makeCard({ id: "audio", mediaType: "Audio" }),
+        makeCard({ id: "movie-1" }),
+        makeCard({ id: "movie-2" }),
+      ];
+    },
+  };
+
+  assert.deepEqual(Array.from(helpers.getPageCardIds(root)), ["movie-1", "movie-2"]);
+});
+
+test("selected item detection follows Jellyfin checkbox state on visible media cards", () => {
+  const makeCard = ({ id, type = "Movie", visible = true }) => {
+    const card = {
+      className: "card",
+      hidden: false,
+      parentElement: null,
+      getAttribute(name) {
+        return {
+          "data-id": id,
+          "data-type": type,
+          "data-mediatype": "Video",
+        }[name] ?? null;
+      },
+      getBoundingClientRect() {
+        return visible ? { width: 200, height: 300 } : { width: 0, height: 0 };
+      },
+      matches() {
+        return false;
+      },
+    };
+    return card;
+  };
+
+  const selectedCard = makeCard({ id: "selected" });
+  const actorCard = makeCard({ id: "actor", type: "Actor" });
+  const checkedIcon = {
+    className: "checkboxIcon-checked",
+    hidden: false,
+    parentElement: null,
+    getAttribute(name) {
+      return name === "aria-hidden" ? "true" : null;
+    },
+    getBoundingClientRect() {
+      return { width: 24, height: 24 };
+    },
+    closest() {
+      return selectedCard;
+    },
+  };
+  const actorIcon = {
+    className: "checkboxIcon-checked",
+    hidden: false,
+    parentElement: null,
+    getAttribute(name) {
+      return name === "aria-hidden" ? "true" : null;
+    },
+    getBoundingClientRect() {
+      return { width: 24, height: 24 };
+    },
+    closest() {
+      return actorCard;
+    },
+  };
+  selectedCard.querySelectorAll = () => [checkedIcon];
+  actorCard.querySelectorAll = () => [actorIcon];
+
+  const documentValue = {
+    querySelectorAll(selector) {
+      if (selector === ".checkboxIcon-checked") return [checkedIcon, actorIcon];
+      if (selector === "div.card[data-id]") return [selectedCard, actorCard];
+      return [];
+    },
+  };
+  const helpers = loadHelpers({}, documentValue);
+
+  assert.deepEqual(Array.from(helpers.getSelectedItems()), ["selected"]);
+});
+
+test("transparent Jellyfin checkbox controls remain selectable and count as selected", async () => {
+  let clickCount = 0;
+  const card = {
+    hidden: false,
+    parentElement: null,
+    getAttribute(name) {
+      return {
+        "data-id": "item-1",
+        "data-type": "Movie",
+        "data-mediatype": "Video",
+      }[name] ?? null;
+    },
+    getBoundingClientRect() {
+      return { width: 211, height: 370 };
+    },
+    matches() {
+      return false;
+    },
+  };
+  const checkbox = {
+    checked: true,
+    hidden: false,
+    parentElement: card,
+    getAttribute(name) {
+      return name === "class" ? "chkItemSelect emby-checkbox" : null;
+    },
+    getBoundingClientRect() {
+      return { width: 1, height: 1 };
+    },
+    matches(selector) {
+      return selector.includes("input.chkItemSelect");
+    },
+    click() {
+      clickCount += 1;
+    },
+  };
+  card.querySelectorAll = selector => selector.includes(":checked") || selector.includes("input.chkItemSelect")
+    ? [checkbox]
+    : [];
+
+  const documentValue = {
+    querySelectorAll(selector) {
+      if (selector === ".checkboxIcon-checked") return [];
+      if (selector === "div.card[data-id]") return [card];
+      return [];
+    },
+  };
+  const helpers = loadHelpers({}, documentValue, {
+    getComputedStyle(element) {
+      return { display: "block", visibility: "visible", opacity: element === checkbox ? "0" : "1" };
+    },
+  });
+
+  assert.equal(helpers.findCardSelectionControl(card), checkbox);
+  assert.deepEqual(Array.from(helpers.getSelectedItems()), ["item-1"]);
+  await helpers.toggleCardSelection(card);
+  assert.equal(clickCount, 1);
+});
+
+test("multi-select toggles Jellyfin's native checkbox when it is available", async () => {
+  const helpers = loadHelpers();
+  let clickCount = 0;
+  const checkbox = {
+    hidden: false,
+    parentElement: null,
+    getAttribute() {
+      return null;
+    },
+    getBoundingClientRect() {
+      return { width: 1, height: 1 };
+    },
+    click() {
+      clickCount += 1;
+    },
+  };
+  const card = {
+    getAttribute(name) {
+      return name === "data-id" ? "item-1" : null;
+    },
+    querySelectorAll(selector) {
+      assert.match(selector, /input\.chkItemSelect/);
+      return [checkbox];
+    },
+  };
+
+  await helpers.toggleCardSelection(card);
+  assert.equal(clickCount, 1);
+});
+
+test("card menu fallback does not mistake the play button for the menu", () => {
+  const makeButton = title => ({
+    hidden: false,
+    parentElement: null,
+    getAttribute(name) {
+      return name === "title" ? title : null;
+    },
+    getBoundingClientRect() {
+      return { width: 24, height: 24 };
+    },
+  });
+  const playButton = makeButton("\u64ad\u653e");
+  const menuButton = makeButton("\u66f4\u591a");
+  const card = {
+    querySelector() {
+      return null;
+    },
+    querySelectorAll(selector) {
+      if (selector.includes("button[title]")) return [playButton, menuButton];
+      return [];
+    },
+  };
+  const helpers = loadHelpers({}, { querySelectorAll: () => [] }, {
+    getComputedStyle(element) {
+      return { display: "block", visibility: "visible", opacity: element === playButton || element === menuButton ? "0" : "1" };
+    },
+  });
+
+  assert.equal(helpers.findCardMenuTrigger(card), menuButton);
+});
+
+test("4x4 selection mode can bootstrap from a later card menu", async () => {
+  let menuOpen = false;
+  let multiSelectMode = false;
+  const selectedIds = new Set();
+  const cardsById = new Map();
+
+  const makeCard = (id, hasMenu) => {
+    const card = {
+      hidden: false,
+      parentElement: null,
+      getAttribute(name) {
+        return {
+          "data-id": id,
+          "data-type": "Movie",
+          "data-mediatype": "Video",
+        }[name] ?? null;
+      },
+      getBoundingClientRect() {
+        return { width: 200, height: 300 };
+      },
+      querySelector() {
+        return null;
+      },
+      querySelectorAll(selector) {
+        if (selector.includes("input.chkItemSelect")) {
+          return multiSelectMode ? [{
+            hidden: false,
+            parentElement: card,
+            getAttribute() {
+              return null;
+            },
+            getBoundingClientRect() {
+              return { width: 1, height: 1 };
+            },
+            click() {
+              selectedIds.add(id);
+            },
+          }] : [];
+        }
+        if (selector.includes('[data-action="menu"]')) {
+          if (!hasMenu) return [];
+          return [{
+            hidden: false,
+            parentElement: card,
+            getAttribute(name) {
+              return name === "data-action" ? "menu" : null;
+            },
+            getBoundingClientRect() {
+              return { width: 24, height: 24 };
+            },
+            click() {
+              menuOpen = true;
+            },
+          }];
+        }
+        return [];
+      },
+    };
+    cardsById.set(id, card);
+    return card;
+  };
+
+  const cardWithoutMenu = makeCard("item-1", false);
+  const cardWithMenu = makeCard("item-2", true);
+  const menuItem = {
+    hidden: false,
+    parentElement: null,
+    getAttribute(name) {
+      return name === "data-id" ? "multiSelect" : null;
+    },
+    getBoundingClientRect() {
+      return { width: 200, height: 40 };
+    },
+    click() {
+      menuOpen = false;
+      multiSelectMode = true;
+      selectedIds.add("item-2");
+    },
+  };
+  const documentValue = {
+    querySelectorAll(selector) {
+      if (selector === ".checkboxIcon-checked") {
+        return Array.from(selectedIds, id => ({
+          hidden: false,
+          parentElement: null,
+          getAttribute(name) {
+            return name === "aria-hidden" ? "true" : null;
+          },
+          getBoundingClientRect() {
+            return { width: 24, height: 24 };
+          },
+          closest() {
+            return cardsById.get(id);
+          },
+        }));
+      }
+      if (selector === "div.card[data-id]") return [cardWithoutMenu, cardWithMenu];
+      if (selector.includes("multiSelect")) return menuOpen ? [menuItem] : [];
+      return [];
+    },
+  };
+  const helpers = loadHelpers({}, documentValue);
+  const attemptedIds = [];
+
+  await helpers.ensureGridSelectionMode(
+    ["item-1", "item-2"],
+    cardsById,
+    attemptedIds,
+    100,
+  );
+
+  assert.deepEqual(attemptedIds, ["item-2"]);
+  assert.equal(multiSelectMode, true);
+  assert.deepEqual(Array.from(selectedIds), ["item-2"]);
 });
 
 test("Grid Play 4x4 selects the first sixteen page items when there is no selection", () => {

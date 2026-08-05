@@ -60,6 +60,19 @@ func TestParsePayloadSupportsEscapedPayload(t *testing.T) {
 	}
 }
 
+func TestParsePayloadSupportsChromiumTrailingSlash(t *testing.T) {
+	payload := Payload{Target: "mpv", Url: "https://example.test/video.mkv"}
+	encoded := encodeTestPayload(t, payload, base64.RawURLEncoding)
+
+	parsed, err := parsePayload(protocolPrefix + encoded + "/")
+	if err != nil {
+		t.Fatalf("parse Chromium-normalized payload: %v", err)
+	}
+	if len(parsed) != 1 || parsed[0].Url != payload.Url {
+		t.Fatalf("unexpected payload: %#v", parsed)
+	}
+}
+
 func TestParsePayloadSupportsArray(t *testing.T) {
 	items := []Payload{
 		{Target: "mpv", Url: "https://example.test/video-1.mkv"},

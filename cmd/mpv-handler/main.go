@@ -112,18 +112,27 @@ func isBase64Candidate(value string) bool {
 }
 
 func decodeBase64Payload(raw string) ([]byte, error) {
-	value := raw
+	value := strings.TrimSpace(raw)
 	if value == "" {
 		return nil, fmt.Errorf("empty payload")
 	}
 
 	candidates := []string{value}
+	// Chromium normalizes jelly-player://<payload> as an authority URL and
+	// passes a trailing slash to Windows protocol handlers. Try the original
+	// value first, then remove only that browser-added slash as a fallback.
+	if strings.HasSuffix(value, "/") {
+		candidates = append(candidates, strings.TrimSuffix(value, "/"))
+	}
 	unescaped, err := url.PathUnescape(value)
 	if err != nil {
 		return nil, fmt.Errorf("invalid URL encoding")
 	}
 	if unescaped != value {
 		candidates = append(candidates, unescaped)
+		if strings.HasSuffix(unescaped, "/") {
+			candidates = append(candidates, strings.TrimSuffix(unescaped, "/"))
+		}
 	}
 
 	encodings := []*base64.Encoding{
@@ -132,15 +141,25 @@ func decodeBase64Payload(raw string) ([]byte, error) {
 		base64.RawStdEncoding.Strict(),
 		base64.StdEncoding.Strict(),
 	}
+	var fallback []byte
 	for _, candidate := range candidates {
 		if !isBase64Candidate(candidate) {
 			continue
 		}
 		for _, encoding := range encodings {
 			if decoded, err := encoding.DecodeString(candidate); err == nil {
-				return decoded, nil
+				if fallback == nil {
+					fallback = decoded
+				}
+				trimmed := bytes.TrimSpace(decoded)
+				if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') && json.Valid(trimmed) {
+					return decoded, nil
+				}
 			}
 		}
+	}
+	if fallback != nil {
+		return fallback, nil
 	}
 
 	return nil, fmt.Errorf("invalid base64 payload")

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Jellyfin External Players (Batch/FullScreen/Subs)
 // @namespace    yifans.tech
-// @version      4.4.0
+// @version      4.4.3
 // @description  Launch MPV, PotPlayer, IINA, and Infuse from Jellyfin, including 4x4 MPV playback.
 // @match        *://*/web/*
 // @grant        none
@@ -20,7 +20,7 @@
       columns: 4,
       rows: 4,
       profile: "multi",
-      selectionTimeoutMs: 1200,
+      selectionTimeoutMs: 2000,
     },
     launchCleanupMs: 2000,
     legacyLaunchDelayMs: 800,
@@ -175,6 +175,23 @@
     return card?.getAttribute?.("data-id") || card?.element?.getAttribute?.("data-id") || "";
   }
 
+  function isMediaCard(card) {
+    if (!card || typeof card.getAttribute !== "function") return false;
+
+    const mediaType = String(card.getAttribute("data-mediatype") || "").trim().toLowerCase();
+    if (mediaType && mediaType !== "video") return false;
+
+    const type = String(card.getAttribute("data-type") || "").trim().toLowerCase();
+    if ([
+      "actor", "artist", "audio", "book", "channel", "collection", "collectionfolder", "director",
+      "folder", "genre", "music", "person", "photo", "playlist", "producer", "program", "studio",
+      "user", "writer",
+    ].includes(type)) return false;
+    if (card.matches?.(".personCard, .actorCard, .directorCard")) return false;
+
+    return true;
+  }
+
   function getPageCards(root = document) {
     if (!root || typeof root.querySelectorAll !== "function") return [];
 
@@ -182,7 +199,7 @@
     const seen = new Set();
     root.querySelectorAll("div.card[data-id]").forEach(card => {
       const id = String(card.getAttribute("data-id") || "").trim();
-      if (!id || seen.has(id)) return;
+      if (!id || seen.has(id) || !isMediaCard(card) || !isVisibleElement(card)) return;
       seen.add(id);
       cards.push({ id, element: card });
     });
@@ -224,33 +241,48 @@
     return { ok: true, pageIds, selectedIds: selected, targets, addedIds };
   }
 
-  function isVisibleElement(element) {
-    if (!element || element.hidden || element.getAttribute?.("aria-hidden") === "true") return false;
+  function isVisibleElement(element, options = {}) {
+    const ignoreOwnAriaHidden = options.ignoreOwnAriaHidden === true;
+    const allowTransparent = options.allowTransparent === true;
+    if (!element || element.hidden) return false;
     let current = element;
     while (current && current !== document) {
-      if (current.hidden || current.getAttribute?.("aria-hidden") === "true") return false;
+      const ariaHidden = current.getAttribute?.("aria-hidden") === "true";
+      if (current.hidden || (ariaHidden && (current !== element || !ignoreOwnAriaHidden))) return false;
       current = current.parentElement;
     }
 
     if (typeof window.getComputedStyle === "function") {
       try {
         const style = window.getComputedStyle(element);
-        if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+        if (style.display === "none" || style.visibility === "hidden" || (!allowTransparent && style.opacity === "0")) return false;
       } catch (_error) {
         // A partially initialized page can reject computed-style lookups.
+      }
+    }
+
+    if (typeof element.getBoundingClientRect === "function") {
+      try {
+        const rect = element.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+      } catch (_error) {
+        // A partially initialized page can reject layout lookups.
       }
     }
     return true;
   }
 
   function isCardSelected(card) {
-    if (!card || typeof card.querySelectorAll !== "function") return false;
-    if (card.matches?.(".selected, .card-selected, [aria-selected=\"true\"]")) return true;
+    if (!card || typeof card.querySelectorAll !== "function" || !isMediaCard(card) || !isVisibleElement(card)) return false;
+    if (card.matches?.(".selected, .card-selected, [aria-selected=\"true\"], [data-selected=\"true\"]")) return true;
 
     const checked = card.querySelectorAll(
-      ".checkboxIcon-checked, [aria-checked=\"true\"], input[type=\"checkbox\"]:checked",
+      ".checkboxIcon-checked, [aria-checked=\"true\"], [data-selected=\"true\"], input.chkItemSelect:checked, input[type=\"checkbox\"]:checked",
     );
-    return Array.from(checked).some(isVisibleElement);
+    return Array.from(checked).some(element => isVisibleElement(element, {
+      ignoreOwnAriaHidden: element?.matches?.(".checkboxIcon-checked") === true,
+      allowTransparent: element?.matches?.(".checkboxIcon-checked, input.chkItemSelect, input[type=\"checkbox\"]") === true,
+    }));
   }
 
   function getContext() {
@@ -279,13 +311,14 @@
     if (!document || typeof document.querySelectorAll !== "function") return [];
     const ids = new Set();
     document.querySelectorAll(".checkboxIcon-checked").forEach(icon => {
-      if (!isVisibleElement(icon)) return;
+      if (!isVisibleElement(icon, { ignoreOwnAriaHidden: true })) return;
       const card = icon.closest("div.card[data-id]") || icon.closest("[data-id]");
+      if (!card || !isMediaCard(card) || !isVisibleElement(card)) return;
       const id = card?.getAttribute("data-id");
       if (id) ids.add(id);
     });
 
-    document.querySelectorAll("div.card[data-id]").forEach(card => {
+    getPageCards().forEach(({ element: card }) => {
       const id = card.getAttribute("data-id");
       if (id && isCardSelected(card)) ids.add(id);
     });
@@ -416,28 +449,44 @@
   function findCardMenuTrigger(card) {
     if (!card || typeof card.querySelector !== "function") return null;
 
-    const explicit = card.querySelector(
+    const explicit = Array.from(card.querySelectorAll(
       '[data-action="menu"], [data-id="menu"], .cardOverlayButton[data-action="menu"]',
-    );
+    )).find(element => isVisibleElement(element, { allowTransparent: true }));
     if (explicit) return explicit;
 
     const candidates = card.querySelectorAll(
-      "[data-action], [data-id], button[aria-label], [role=\"button\"]",
+      "[data-action], [data-id], button[aria-label], button[title], [role=\"button\"]",
     );
     return Array.from(candidates).find(element => {
+      if (!isVisibleElement(element, { allowTransparent: true })) return false;
       const action = String(element.getAttribute?.("data-action") || "").toLowerCase();
       const dataId = String(element.getAttribute?.("data-id") || "").toLowerCase();
       const label = String(
         element.getAttribute?.("aria-label") || element.getAttribute?.("title") || "",
       ).toLowerCase();
-      return action === "menu" || action === "more" || dataId === "menu" || /menu|more|actions/.test(label);
+      return action === "menu" || action === "more" || dataId === "menu" || /menu|more|actions|\u83dc\u5355|\u66f4\u591a/.test(label);
     }) || null;
+  }
+
+  function findCardSelectionControl(card) {
+    if (!card || typeof card.querySelectorAll !== "function") return null;
+    const controls = card.querySelectorAll(
+      'input.chkItemSelect, input[type="checkbox"], [role="checkbox"], .checkboxOutline',
+    );
+    return Array.from(controls).find(control => (
+      typeof control.click === "function" && isVisibleElement(control, { allowTransparent: true })
+    )) || null;
   }
 
   function findVisibleMultiSelectMenuItem() {
     if (typeof document.querySelectorAll !== "function") return null;
-    const items = document.querySelectorAll("button.actionSheetMenuItem[data-id=\"multiSelect\"]");
-    const visible = Array.from(items).filter(isVisibleElement);
+    const items = document.querySelectorAll(
+      'button.actionSheetMenuItem[data-id="multiSelect"], ' +
+      '[data-id="multiSelect"].actionSheetMenuItem, ' +
+      '[data-id="multiSelect"][role="menuitem"], ' +
+      '[data-action="multiSelect"]',
+    );
+    const visible = Array.from(new Set(items)).filter(isVisibleElement);
     return visible[visible.length - 1] || null;
   }
 
@@ -467,7 +516,7 @@
     });
   }
 
-  async function toggleCardSelection(card) {
+  async function selectCardFromMenu(card) {
     const trigger = findCardMenuTrigger(card);
     if (!trigger || typeof trigger.click !== "function") {
       throw new Error(`Card ${card?.getAttribute?.("data-id") || "unknown"} has no action menu`);
@@ -484,6 +533,37 @@
       throw new Error("Jellyfin multi-select action is unavailable");
     }
     menuItem.click();
+  }
+
+  async function toggleCardSelection(card) {
+    const control = findCardSelectionControl(card);
+    if (control) {
+      control.click();
+      return;
+    }
+    await selectCardFromMenu(card);
+  }
+
+  async function ensureGridSelectionMode(targetIds, cardsById, attemptedIds, timeoutMs) {
+    const targetCards = targetIds
+      .map(id => cardsById.get(id))
+      .filter(Boolean);
+    if (targetCards.some(card => findCardSelectionControl(card))) return;
+
+    for (const id of targetIds) {
+      const card = cardsById.get(id);
+      if (!card || getSelectedItems().includes(id)) continue;
+      if (!findCardMenuTrigger(card)) continue;
+
+      attemptedIds.push(id);
+      await selectCardFromMenu(card);
+      if (!(await waitForSelectionState(id, true, timeoutMs))) {
+        throw new Error(`Could not confirm selection for card ${id}`);
+      }
+      return;
+    }
+
+    throw new Error("Jellyfin multi-select action is unavailable for the selected media");
   }
 
   async function rollbackGridSelection(ids, cardsById) {
@@ -514,6 +594,8 @@
     const attemptedIds = [];
 
     try {
+      await ensureGridSelectionMode(plan.targets, cardsById, attemptedIds, options.timeoutMs);
+
       for (const id of plan.addedIds) {
         if (getSelectedItems().includes(id)) continue;
         const card = cardsById.get(id);
@@ -894,20 +976,24 @@
       getPageCardIds,
       getContext,
       getSelectedItems,
+      findCardMenuTrigger,
       planGrid16Targets,
       getGridGeometry,
       getGeometry,
+      findCardSelectionControl,
       buildMpvPayload,
       resolveTarget,
       resolveTargets,
       handlePlay,
       syncGrid16Selection,
+      ensureGridSelectionMode,
+      toggleCardSelection,
       handleGrid16Play,
       sanitizeLogText,
     };
     return;
   }
 
-  log("v4.4.0 loaded");
+  log("v4.4.3 loaded");
   tick();
 })();

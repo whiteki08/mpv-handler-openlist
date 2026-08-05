@@ -14,7 +14,7 @@ The userscript builds the canonical Jellyfin stream endpoint:
 
 It passes API parameters with normal query separators (`&`). MPV uses the `jelly-player://` protocol and the Windows Go handler. PotPlayer, IINA, and Infuse keep their native platform URL schemes.
 
-Normal `Grid Play` remains limited to four items. On a Jellyfin listing page, the userscript also shows `Grid Play 4x4 (16)`, which uses the first sixteen unique `div.card[data-id]` elements currently rendered in the page DOM. It does not request additional pages.
+Normal `Grid Play` remains limited to four items. On a Jellyfin listing page, the userscript also shows `Grid Play 4x4 (16)`, which uses the first sixteen unique, visible video cards currently rendered in the page DOM. Hidden detail-page cards, people cards, and additional pages are ignored.
 
 When no items are selected, 4x4 selects those first sixteen cards through Jellyfin's native card menu. When one to fifteen items are already selected, it preserves them and fills the remaining slots in page order. More than sixteen existing selections, or fewer than sixteen cards on the current page, are rejected without changing the selection. Every selection change is verified; an unconfirmed change is rolled back.
 
@@ -23,7 +23,7 @@ When no items are selected, 4x4 selects those first sixteen cards through Jellyf
 ## Windows Installation
 
 1. Download or build `mpv-handler.exe` and place it in a permanent directory.
-2. Create `mpv-handler.ini` next to the executable:
+2. Create the executable-specific INI next to the executable. For example, `mpv-handler-amd64.exe` uses `mpv-handler-amd64.ini`:
 
 ```ini
 [players]
@@ -43,6 +43,8 @@ log=true
 `--install` only registers the protocol. It does not accept a player path; configure paths in the INI file instead.
 
 The default log file is `mpv-handler.log` next to the executable. URLs and API keys are not written to the log.
+
+Chromium may normalize the `jelly-player://<Base64 URL-safe JSON>` authority form by appending a trailing `/` before invoking the Windows handler. The handler accepts this browser-generated suffix without changing the payload format.
 
 The HTTP URL itself always uses real `&` query separators. PotPlayer keeps its native `potplayer://` schema, so only the outer schema escapes those separators as `%26`; MPV, IINA, and Infuse receive the decoded HTTP URL.
 

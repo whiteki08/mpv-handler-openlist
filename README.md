@@ -1,83 +1,117 @@
-# Jellyfin MPV Desktop Bridge (Fork)
+# Jellyfin External Player Bridge
 
 [中文](./README_zh.md)
 
-An advanced bridge tool for local players, heavily refactored from [mpv-handler-openlist](https://github.com/outlook84/mpv-handler-openlist).
+This project launches Jellyfin media in MPV, PotPlayer, IINA, or Infuse from a browser userscript.
 
-While this project started as a fork, it has evolved into a completely new beast. We have replaced the basic URL handling with a powerful **Universal Jelly-Player Schema**, designed specifically to bring a **desktop-class multi-window concurrent playback experience** to Jellyfin/Emby Web clients.
+## How It Works
 
-## Key Innovations
+The userscript builds the canonical Jellyfin stream endpoint:
 
-1. **Universal Protocol Architecture**
-* Replaced the legacy `mpv://` with the versatile `jelly-player://` protocol.
-* **JSON Payload**: Transmits complex metadata via Base64-encoded JSON, including window geometry, subtitles, MPV profiles, and titles.
-
-
-2. **Batch Concurrent Processing**
-* **Bypassing Browser Limits**: The frontend sends a single array payload containing multiple video instructions.
-* **Instant Launch**: The Go backend parses the batch and launches 4+ MPV processes simultaneously, completely avoiding browser popup blockers and focus-stealing issues.
-
-
-3. **Smart Video Wall**
-* **Pixel-Perfect Layout**: Works with the companion UserScript to calculate physical pixel coordinates based on OS DPI.
-* **Immersive Experience**: Supports full-screen 2x2 grids that cover the taskbar, or work-area aware layouts.
-* **Auto-Subtitles**: Automatically fetches external subtitle URLs from the Jellyfin API and passes them to MPV.
-
-
-4. **Full-Stack Integration**
-* This is not just a handler; it's a system comprising a **Go Backend** and a **Frontend UserScript**.
-
-
-
-## Installation
-
-### Step 1: Deploy Backend
-
-1. Download `mpv-handler.exe` from Releases.
-2. Place it in a permanent folder (e.g., inside your MPV folder).
-3. Run CMD/PowerShell as Administrator and execute:
-```shell
-.\mpv-handler.exe --install "D:\Path\To\Your\mpv.exe"
-
+```text
+/Videos/{itemId}/stream.{container}
 ```
 
+It passes API parameters with normal query separators (`&`). MPV uses the `jelly-player://` protocol and the Windows Go handler. PotPlayer, IINA, and Infuse keep their native platform URL schemes.
 
-*This registers the `jelly-player://` protocol.*
+Normal `Grid Play` remains limited to four items. On a Jellyfin listing page, the userscript also shows `Grid Play 4x4 (16)`, which uses the first sixteen unique `div.card[data-id]` elements currently rendered in the page DOM. It does not request additional pages.
 
-### Step 2: Configure MPV (Critical)
+When no items are selected, 4x4 selects those first sixteen cards through Jellyfin's native card menu. When one to fifteen items are already selected, it preserves them and fills the remaining slots in page order. More than sixteen existing selections, or fewer than sixteen cards on the current page, are rejected without changing the selection. Every selection change is verified; an unconfirmed change is rolled back.
 
-To achieve the seamless video wall effect, add this to your MPV `portable_config/profiles.conf`:
+4x4 uses the existing `jelly-player://` protocol and the MPV `multi` profile. All sixteen media items, including subtitle preparation when applicable, must resolve successfully before any MPV process is launched. Normal four-item MPV playback keeps its per-item failure isolation. The Go handler accepts a single payload or an array and limits one protocol call to sixteen items.
+
+## Windows Installation
+
+1. Download or build `mpv-handler.exe` and place it in a permanent directory.
+2. Create `mpv-handler.ini` next to the executable:
+
+```ini
+[players]
+mpv=C:\Program Files\mpv\mpv.exe
+potplayer=C:\Program Files\DAUM\PotPlayer\PotPlayerMini64.exe
+
+[config]
+log=true
+```
+
+3. Run the following command as an administrator to register `jelly-player://`:
+
+```powershell
+.\mpv-handler.exe --install
+```
+
+`--install` only registers the protocol. It does not accept a player path; configure paths in the INI file instead.
+
+The default log file is `mpv-handler.log` next to the executable. URLs and API keys are not written to the log.
+
+The HTTP URL itself always uses real `&` query separators. PotPlayer keeps its native `potplayer://` schema, so only the outer schema escapes those separators as `%26`; MPV, IINA, and Infuse receive the decoded HTTP URL.
+
+## MPV Profiles
+
+For a 4x4, sixteen-window video wall, configure the `multi` profile in MPV's `portable_config/profiles.conf`:
 
 ```ini
 [multi]
 profile-desc=Jellyfin Video Wall
-# Disable snapping and borders for seamless tiling
 snap-window=no
 border=no
 ontop=yes
-# Disable auto-fit, obey frontend geometry strictly
 autofit=no
 keepaspect-window=no
-# Optimization
 osc=no
 osd-level=0
 force-window=immediate
-
 ```
 
-### Step 3: Install UserScript
+Set `osScale` at the top of `script.js` to match the Windows display scaling used by the browser.
 
-1. Install Tampermonkey in your browser.
-2. Install `script.js` found in the root of this repo.
-3. Edit the script configuration to match your **Windows Scaling** (e.g., `osScale: 2.0`).
-4. Refresh Jellyfin, select multiple videos, and click **"Grid Play"**.
+## Userscript
 
-## Protocol Specification
+Install `script.js` with Tampermonkey or another userscript manager, then refresh Jellyfin. The regular player buttons appear on item details pages and when selecting media items. A listing page with rendered media cards shows `Grid Play 4x4 (16)`; detail pages do not show that button.
 
-Protocol: `jelly-player://<Base64_Safe_URL_Encoded_JSON>`
+## Protocol
 
-Advanced users can utilize this schema to drive MPV from other web apps. The payload supports both single objects and arrays (for batch execution).
+```text
+jelly-player://<Base64 URL-safe JSON>
+```
+
+Example:
+
+```json
+[
+  {
+    "mode": "mpv",
+    "url": "https://server/Videos/item-id/stream.mkv?api_key=TOKEN&Static=true&MediaSourceId=source-id&jfp=1",
+    "sub": "https://server/Videos/item-id/source-id/Subtitles/2/Stream.srt?api_key=TOKEN",
+    "profile": "multi",
+    "geometry": "1920x1080+0+0",
+    "title": "Video 1"
+  }
+]
+```
+
+Supported `mode` values in the Go handler are `mpv` and `potplayer`. The userscript currently uses the native PotPlayer scheme directly, so PotPlayer must have its native URL scheme registered by the application.
+
+The HTTP URL inside every payload uses real `&` query separators. PotPlayer's outer `potplayer://` URL encodes those separators as `%26` so its native parser keeps the complete HTTP URL; IINA and Infuse keep their native URL formats as well.
+
+## Development
+
+Run the JavaScript tests with Node.js:
+
+```powershell
+node --test tests/script.test.mjs
+node --check script.js
+```
+
+The Go tests require Windows because the handler uses the Windows registry package:
+
+```powershell
+go test ./...
+go vet ./...
+```
+
+Never commit a Jellyfin API key. If a key is exposed in a URL or log, revoke it and create a replacement.
 
 ## Credits
 
-Forked from [mpv-handler-openlist](https://github.com/outlook84/mpv-handler-openlist). We pay tribute to the original author for providing the solid foundation that made this advanced innovation possible.
+Based on [mpv-handler-openlist](https://github.com/outlook84/mpv-handler-openlist).

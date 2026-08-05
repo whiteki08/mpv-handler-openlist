@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Jellyfin External Players (Batch/FullScreen/Subs)
 // @namespace    yifans.tech
-// @version      4.2.0
-// @description  Hybrid: MPV(Batch+Subs) + PotPlayer. Fixes external subtitles & taskbar overlap.
+// @version      4.4.0
+// @description  Launch MPV, PotPlayer, IINA, and Infuse from Jellyfin, including 4x4 MPV playback.
 // @match        *://*/web/*
 // @grant        none
 // @run-at       document-idle
@@ -11,251 +11,698 @@
 (function () {
   "use strict";
 
-  // =========================
-  // Config
-  // =========================
   const CONFIG = {
-    // 【关键设置】Windows 系统缩放比例
-    // 100% -> 1.0 | 150% -> 1.5 | 200% -> 2.0
     osScale: 2.0,
-
     schemeGeneric: "jelly-player",
-
+    maxItems: 4,
+    grid16: {
+      maxItems: 16,
+      columns: 4,
+      rows: 4,
+      profile: "multi",
+      selectionTimeoutMs: 1200,
+    },
+    launchCleanupMs: 2000,
+    legacyLaunchDelayMs: 800,
     showOn: {
       windows: { mpv: true, pot: true },
-      macOS:   { mpv: true, pot: false, iina: true, infuse: true },
-      other:   { mpv: false, pot: false, iina: false, infuse: false },
+      macOS: { mpv: true, pot: false, iina: true, infuse: true },
+      other: { mpv: false, pot: false, iina: false, infuse: false },
     },
   };
 
   const PANEL_ID = "jfp-extplayers";
   const STYLE_ID = "jfp-extplayers-style";
+  const SENSITIVE_QUERY_PATTERN = /((?:[?&]|\b)(?:api_key|apikey|access_token|token)=)[^&#\s]*/gi;
+  const PROTOCOL_PAYLOAD_PATTERN = /\b(?:jelly-player|potplayer|iina|infuse):\/\/\S+/gi;
 
-  function log(...args) { console.log("[JFP]", ...args); }
+  function redactSensitiveText(value) {
+    let text = String(value ?? "");
+    text = text.replace(PROTOCOL_PAYLOAD_PATTERN, match => {
+      const separator = match.indexOf("://");
+      return `${match.slice(0, separator)}://<redacted>`;
+    });
+    return text.replace(SENSITIVE_QUERY_PATTERN, "$1<redacted>");
+  }
 
-  // =========================
-  // Core: Base64 & JSON Builder
-  // =========================
-  function base64Encode(obj) {
-    const jsonStr = JSON.stringify(obj);
-    return btoa(encodeURIComponent(jsonStr).replace(/%([0-9A-F]{2})/g,
-        (match, p1) => String.fromCharCode('0x' + p1)))
-        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  function sanitizeLogText(value) {
+    return redactSensitiveText(value).replace(/\r/g, "\\r").replace(/\n/g, "\\n");
+  }
+
+  function log(event, details) {
+    if (details === undefined) {
+      console.log("[JFP]", event);
+    } else {
+      console.log("[JFP]", event, typeof details === "string" ? sanitizeLogText(details) : details);
+    }
+  }
+
+  function errorText(error) {
+    if (error instanceof Error && error.message) return error.message;
+    return String(error || "Unknown error");
+  }
+
+  function showError(message) {
+    const safeMessage = redactSensitiveText(message);
+    log("error", safeMessage);
+    if (typeof window.alert === "function") window.alert(safeMessage);
+  }
+
+  function encodeBase64Utf8(value) {
+    const bytes = new TextEncoder().encode(value);
+    let binary = "";
+    const chunkSize = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+    }
+    return btoa(binary);
+  }
+
+  function base64Encode(value) {
+    return encodeBase64Utf8(JSON.stringify(value))
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
   }
 
   function buildGenericUrl(payload) {
     return `${CONFIG.schemeGeneric}://${base64Encode(payload)}`;
   }
 
+  function parseHttpUrl(value, label) {
+    if (!value) throw new Error(`${label || "URL"} is missing`);
+    let parsed;
+    try {
+      parsed = new URL(String(value));
+    } catch (_error) {
+      throw new Error(`${label || "URL"} is invalid`);
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error(`${label || "URL"} must use HTTP or HTTPS`);
+    }
+    if (!parsed.hostname) throw new Error(`${label || "URL"} has no host`);
+    return parsed;
+  }
+
   function buildPotPlayerNativeUrl(httpUrl) {
-    const safeUrl = encodeURI(httpUrl).replace(/&/g, '%26');
+    const parsed = parseHttpUrl(httpUrl, "PotPlayer URL");
+    // PotPlayer treats raw ampersands in its native scheme as separators.
+    // Keep the HTTP URL valid, then escape only the outer scheme boundary.
+    const safeUrl = encodeURI(parsed.toString()).replace(/&/g, "%26");
     return `potplayer://${safeUrl}`;
   }
 
   function buildIinaUrl(httpUrl) {
-    return `iina://weblink?url=${encodeURIComponent(httpUrl)}&new_window=1`;
-  }
-  function buildInfuseUrl(httpUrl) {
-    return `infuse://x-callback-url/play?url=${encodeURIComponent(httpUrl)}`;
+    const parsed = parseHttpUrl(httpUrl, "IINA URL");
+    return `iina://weblink?url=${encodeURIComponent(parsed.toString())}&new_window=1`;
   }
 
-  // =========================
-  // Jellyfin Data & Selection
-  // =========================
+  function buildInfuseUrl(httpUrl) {
+    const parsed = parseHttpUrl(httpUrl, "Infuse URL");
+    return `infuse://x-callback-url/play?url=${encodeURIComponent(parsed.toString())}`;
+  }
+
+  function getApiClient() {
+    const api = window.ApiClient;
+    if (!api) throw new Error("Jellyfin ApiClient is not available");
+    if (typeof api.accessToken !== "function") throw new Error("Jellyfin access token API is unavailable");
+    return api;
+  }
+
+  function getServerBaseUrl(api) {
+    const rawAddress = String(api?._serverAddress || "").trim();
+    if (!rawAddress) throw new Error("Jellyfin server address is unavailable");
+
+    const parsed = parseHttpUrl(rawAddress, "Jellyfin server address");
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString().replace(/\/+$/, "");
+  }
+
+  function getAccessToken(api) {
+    const token = String(api.accessToken() || "").trim();
+    if (!token) throw new Error("Jellyfin access token is unavailable");
+    return token;
+  }
+
+  function buildJellyfinUrl(api, pathSegments, query) {
+    const path = pathSegments.map(segment => encodeURIComponent(String(segment))).join("/");
+    const url = new URL(`${getServerBaseUrl(api)}/${path}`);
+    Object.entries(query || {}).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== "") {
+        url.searchParams.set(key, String(value));
+      }
+    });
+    return url.toString();
+  }
+
+  function uniqueIds(values) {
+    const result = [];
+    const seen = new Set();
+    for (const value of Array.isArray(values) ? values : []) {
+      const id = String(value ?? "").trim();
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      result.push(id);
+    }
+    return result;
+  }
+
+  function getCardId(card) {
+    if (typeof card === "string") return card;
+    const objectId = card?.id;
+    if (objectId !== undefined && objectId !== null && String(objectId).trim()) return objectId;
+    return card?.getAttribute?.("data-id") || card?.element?.getAttribute?.("data-id") || "";
+  }
+
+  function getPageCards(root = document) {
+    if (!root || typeof root.querySelectorAll !== "function") return [];
+
+    const cards = [];
+    const seen = new Set();
+    root.querySelectorAll("div.card[data-id]").forEach(card => {
+      const id = String(card.getAttribute("data-id") || "").trim();
+      if (!id || seen.has(id)) return;
+      seen.add(id);
+      cards.push({ id, element: card });
+    });
+    return cards;
+  }
+
+  function getPageCardIds(root = document) {
+    return getPageCards(root).map(card => card.id);
+  }
+
+  function planGrid16Targets(pageCards, selectedIds, maxItems = CONFIG.grid16.maxItems) {
+    const limit = Number(maxItems);
+    const pageIds = uniqueIds((Array.isArray(pageCards) ? pageCards : []).map(getCardId));
+    const selected = uniqueIds(selectedIds);
+
+    if (!Number.isInteger(limit) || limit < 1) {
+      return { ok: false, reason: "invalid-limit", pageIds, selectedIds: selected, targets: [], addedIds: [] };
+    }
+    if (selected.length > limit) {
+      return { ok: false, reason: "too-many-selected", pageIds, selectedIds: selected, targets: [], addedIds: [] };
+    }
+    if (pageIds.length < limit) {
+      return { ok: false, reason: "not-enough-page-items", pageIds, selectedIds: selected, targets: [], addedIds: [] };
+    }
+
+    const selectedSet = new Set(selected);
+    const targets = selected.slice();
+    const addedIds = [];
+    for (const id of pageIds) {
+      if (targets.length >= limit || selectedSet.has(id)) continue;
+      selectedSet.add(id);
+      targets.push(id);
+      addedIds.push(id);
+    }
+
+    if (targets.length < limit) {
+      return { ok: false, reason: "not-enough-page-items", pageIds, selectedIds: selected, targets: [], addedIds: [] };
+    }
+    return { ok: true, pageIds, selectedIds: selected, targets, addedIds };
+  }
+
+  function isVisibleElement(element) {
+    if (!element || element.hidden || element.getAttribute?.("aria-hidden") === "true") return false;
+    let current = element;
+    while (current && current !== document) {
+      if (current.hidden || current.getAttribute?.("aria-hidden") === "true") return false;
+      current = current.parentElement;
+    }
+
+    if (typeof window.getComputedStyle === "function") {
+      try {
+        const style = window.getComputedStyle(element);
+        if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+      } catch (_error) {
+        // A partially initialized page can reject computed-style lookups.
+      }
+    }
+    return true;
+  }
+
+  function isCardSelected(card) {
+    if (!card || typeof card.querySelectorAll !== "function") return false;
+    if (card.matches?.(".selected, .card-selected, [aria-selected=\"true\"]")) return true;
+
+    const checked = card.querySelectorAll(
+      ".checkboxIcon-checked, [aria-checked=\"true\"], input[type=\"checkbox\"]:checked",
+    );
+    return Array.from(checked).some(isVisibleElement);
+  }
 
   function getContext() {
     const hash = location.hash || "";
     if (hash.includes("#/details")) {
-      const m = hash.match(/[?&]id=([^&]+)/i);
-      return { type: 'detail', id: m ? decodeURIComponent(m[1]) : null };
+      const match = hash.match(/[?&]id=([^&]+)/i);
+      let id = null;
+      if (match) {
+        try {
+          id = decodeURIComponent(match[1]);
+        } catch (_error) {
+          id = null;
+        }
+      }
+      return { type: "detail", id };
     }
+
+    const pageIds = getPageCardIds();
     const selected = getSelectedItems();
-    if (selected.length > 0) {
-      return { type: 'selection', ids: selected };
-    }
-    return { type: 'none' };
+    if (selected.length > 0) return { type: "selection", ids: selected, pageIds };
+    if (pageIds.length > 0) return { type: "listing", pageIds };
+    return { type: "none" };
   }
 
   function getSelectedItems() {
-    const ids = [];
-    const allIcons = document.querySelectorAll('.checkboxIcon-checked');
-    
-    allIcons.forEach(icon => {
-      if (icon.offsetParent === null) return;
-      const style = window.getComputedStyle(icon);
-      if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return;
-
-      const card = icon.closest('[data-id]');
-      if (card) {
-        ids.push(card.getAttribute('data-id'));
-      }
+    if (!document || typeof document.querySelectorAll !== "function") return [];
+    const ids = new Set();
+    document.querySelectorAll(".checkboxIcon-checked").forEach(icon => {
+      if (!isVisibleElement(icon)) return;
+      const card = icon.closest("div.card[data-id]") || icon.closest("[data-id]");
+      const id = card?.getAttribute("data-id");
+      if (id) ids.add(id);
     });
 
-    return [...new Set(ids)];
+    document.querySelectorAll("div.card[data-id]").forEach(card => {
+      const id = card.getAttribute("data-id");
+      if (id && isCardSelected(card)) ids.add(id);
+    });
+    return [...ids];
   }
 
   function getOS() {
-    const u = navigator.userAgent;
-    if (/Windows/i.test(u)) return "windows";
-    if (/Macintosh|MacIntel/i.test(u)) return "macOS";
+    const userAgent = navigator.userAgent || "";
+    if (/Windows/i.test(userAgent)) return "windows";
+    if (/Macintosh|MacIntel/i.test(userAgent)) return "macOS";
     return "other";
   }
 
   async function getPlayableItem(itemId) {
-    const api = window.ApiClient;
-    if (!api) return null;
+    const api = getApiClient();
     const userId = api?._serverInfo?.UserId;
+    if (!userId) throw new Error("Jellyfin user ID is unavailable");
+    if (typeof api.getItem !== "function") throw new Error("Jellyfin item API is unavailable");
 
     let item = await api.getItem(userId, itemId);
+    if (!item) throw new Error("Jellyfin item was not found");
 
-    if (item?.Type === "Series") {
+    if (item.Type === "Series") {
+      if (typeof api.getNextUpEpisodes !== "function") throw new Error("Jellyfin next-up API is unavailable");
       const nextUp = await api.getNextUpEpisodes({ SeriesId: itemId, UserId: userId });
-      if (nextUp?.Items?.[0]) item = await api.getItem(userId, nextUp.Items[0].Id);
-    } else if (item?.Type === "Season") {
+      const nextItem = nextUp?.Items?.[0];
+      if (!nextItem?.Id) throw new Error("Series has no playable next episode");
+      item = await api.getItem(userId, nextItem.Id);
+    } else if (item.Type === "Season") {
+      if (typeof api.getItems !== "function") throw new Error("Jellyfin season API is unavailable");
       const seasonItems = await api.getItems(userId, { parentId: itemId });
-      if (seasonItems?.Items?.[0]) item = await api.getItem(userId, seasonItems.Items[0].Id);
+      const firstItem = seasonItems?.Items?.[0];
+      if (!firstItem?.Id) throw new Error("Season has no playable episode");
+      item = await api.getItem(userId, firstItem.Id);
     }
+
+    if (!item) throw new Error("Playable item could not be resolved");
     return item;
   }
 
   function getStreamUrl(item) {
-    const api = window.ApiClient;
-    const ms = item?.MediaSources?.[0];
-    if (!ms) return null;
-    return (
-      `${api._serverAddress}/emby/videos/${encodeURIComponent(item.Id)}/stream.${encodeURIComponent(ms.Container || "mkv")}` +
-      `?api_key=${encodeURIComponent(api.accessToken())}` +
-      `&Static=true` +
-      `&MediaSourceId=${encodeURIComponent(ms.Id)}` +
-      `&jfp=1`
+    const api = getApiClient();
+    const mediaSource = item?.MediaSources?.[0];
+    if (!item?.Id) throw new Error("Media item ID is missing");
+    if (!mediaSource?.Id) throw new Error("Media source ID is missing");
+
+    const container = String(mediaSource.Container || "mkv").trim().toLowerCase();
+    if (!/^[a-z0-9]+$/.test(container)) throw new Error("Media container is invalid");
+
+    return buildJellyfinUrl(
+      api,
+      ["Videos", item.Id, `stream.${container}`],
+      {
+        api_key: getAccessToken(api),
+        Static: true,
+        MediaSourceId: mediaSource.Id,
+        jfp: 1,
+      },
     );
   }
 
-  // 【新增】获取外挂字幕链接
-  function getSubtitleUrl(item) {
-    const api = window.ApiClient;
-    const ms = item?.MediaSources?.[0];
-    if (!ms || !ms.MediaStreams) return "";
+  function getSubtitleUrl(item, options = {}) {
+    const mediaSource = item?.MediaSources?.[0];
+    const streams = mediaSource?.MediaStreams;
+    if (!item?.Id || !mediaSource?.Id || !Array.isArray(streams)) return "";
 
-    // 查找逻辑：
-    // 1. 必须是 Subtitle 类型
-    // 2. 必须是 IsExternal = true (外挂)
-    // 3. 优先找 IsDefault = true 的，如果没有，则取第一个外挂字幕
-    let sub = ms.MediaStreams.find(s => s.Type === 'Subtitle' && s.IsExternal && s.IsDefault);
-    if (!sub) {
-      sub = ms.MediaStreams.find(s => s.Type === 'Subtitle' && s.IsExternal);
+    let subtitle = streams.find(stream => stream.Type === "Subtitle" && stream.IsExternal && stream.IsDefault);
+    if (!subtitle) subtitle = streams.find(stream => stream.Type === "Subtitle" && stream.IsExternal);
+    if (!subtitle) return "";
+
+    const fail = message => {
+      if (options.strict) throw new Error(message);
+      return "";
+    };
+    if (subtitle.Index === undefined || subtitle.Index === null || String(subtitle.Index).trim() === "") {
+      return fail("Subtitle stream index is missing");
     }
+    const subtitleIndex = Number(subtitle.Index);
+    if (!Number.isInteger(subtitleIndex) || subtitleIndex < 0) return fail("Subtitle stream index is invalid");
 
-    if (!sub) return ""; // 没有外挂字幕
+    const codec = String(subtitle.Codec || "srt").trim().toLowerCase();
+    if (!/^[a-z0-9]+$/.test(codec)) return fail("Subtitle codec is invalid");
 
-    // 构造字幕 URL: /Videos/{Id}/{MediaSourceId}/Subtitles/{Index}/Stream.{Codec}
-    // 注意：必须带上 api_key，否则 MPV 下载会 401 报错
-    return (
-        `${api._serverAddress}/Videos/${encodeURIComponent(item.Id)}/${encodeURIComponent(ms.Id)}/Subtitles/${sub.Index}/Stream.${sub.Codec || 'srt'}` +
-        `?api_key=${encodeURIComponent(api.accessToken())}`
+    const api = getApiClient();
+
+    return buildJellyfinUrl(
+      api,
+      ["Videos", item.Id, mediaSource.Id, "Subtitles", subtitleIndex, `Stream.${codec}`],
+      { api_key: getAccessToken(api) },
     );
   }
 
-  // =========================
-  // Logic: Grid Calculation (Full Screen)
-  // =========================
-
-  function getGeometry(index, total) {
+  function getGridGeometry(index, total, columns, rows) {
     if (total <= 1) return "";
 
-    const fullW = window.screen.width;
-    const fullH = window.screen.height;
-    const scale = CONFIG.osScale;
-    
-    const W = Math.floor((fullW * scale) / 2);
-    const H = Math.floor((fullH * scale) / 2);
-    
-    // 强制从 (0,0) 开始
-    const grids = [
-      `${W}x${H}+0+0`,
-      `${W}x${H}+${W}+0`,
-      `${W}x${H}+0+${H}`,
-      `${W}x${H}+${W}+${H}`
-    ];
-    
-    return grids[index] || "";
+    const columnCount = Number(columns);
+    const rowCount = Number(rows);
+    const itemIndex = Number(index);
+    const fullWidth = Number(window.screen?.width || 0);
+    const fullHeight = Number(window.screen?.height || 0);
+    const scale = Number(CONFIG.osScale);
+    if (!Number.isInteger(columnCount) || columnCount < 1 || !Number.isInteger(rowCount) || rowCount < 1) return "";
+    if (!Number.isInteger(itemIndex) || itemIndex < 0 || itemIndex >= columnCount * rowCount) return "";
+    if (!Number.isFinite(scale) || scale <= 0 || fullWidth <= 0 || fullHeight <= 0) return "";
+
+    const width = Math.floor((fullWidth * scale) / columnCount);
+    const height = Math.floor((fullHeight * scale) / rowCount);
+    const column = itemIndex % columnCount;
+    const row = Math.floor(itemIndex / columnCount);
+    return `${width}x${height}+${column * width}+${row * height}`;
   }
 
-  // =========================
-  // Launchers
-  // =========================
+  function getGeometry(index, total, columns = 2, rows = 2) {
+    if (columns && typeof columns === "object") {
+      rows = columns.rows ?? 2;
+      columns = columns.columns ?? 2;
+    }
+    return getGridGeometry(index, total, columns, rows);
+  }
+
+  function getLayoutValues(layout = {}) {
+    const columns = Number(layout.columns ?? 2);
+    const rows = Number(layout.rows ?? 2);
+    const maxItems = Number(layout.maxItems ?? columns * rows);
+    return { columns, rows, maxItems };
+  }
+
+  function findCardMenuTrigger(card) {
+    if (!card || typeof card.querySelector !== "function") return null;
+
+    const explicit = card.querySelector(
+      '[data-action="menu"], [data-id="menu"], .cardOverlayButton[data-action="menu"]',
+    );
+    if (explicit) return explicit;
+
+    const candidates = card.querySelectorAll(
+      "[data-action], [data-id], button[aria-label], [role=\"button\"]",
+    );
+    return Array.from(candidates).find(element => {
+      const action = String(element.getAttribute?.("data-action") || "").toLowerCase();
+      const dataId = String(element.getAttribute?.("data-id") || "").toLowerCase();
+      const label = String(
+        element.getAttribute?.("aria-label") || element.getAttribute?.("title") || "",
+      ).toLowerCase();
+      return action === "menu" || action === "more" || dataId === "menu" || /menu|more|actions/.test(label);
+    }) || null;
+  }
+
+  function findVisibleMultiSelectMenuItem() {
+    if (typeof document.querySelectorAll !== "function") return null;
+    const items = document.querySelectorAll("button.actionSheetMenuItem[data-id=\"multiSelect\"]");
+    const visible = Array.from(items).filter(isVisibleElement);
+    return visible[visible.length - 1] || null;
+  }
+
+  function waitForSelectionState(id, expected, timeoutMs = CONFIG.grid16.selectionTimeoutMs) {
+    const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+    return new Promise(resolve => {
+      const check = () => {
+        let selected;
+        try {
+          selected = getSelectedItems().includes(id);
+        } catch (_error) {
+          resolve(false);
+          return;
+        }
+
+        if (selected === expected) {
+          resolve(true);
+          return;
+        }
+        if (Date.now() >= deadline || typeof window.setTimeout !== "function") {
+          resolve(false);
+          return;
+        }
+        window.setTimeout(check, 25);
+      };
+      check();
+    });
+  }
+
+  async function toggleCardSelection(card) {
+    const trigger = findCardMenuTrigger(card);
+    if (!trigger || typeof trigger.click !== "function") {
+      throw new Error(`Card ${card?.getAttribute?.("data-id") || "unknown"} has no action menu`);
+    }
+
+    trigger.click();
+    let menuItem = findVisibleMultiSelectMenuItem();
+    const deadline = Date.now() + CONFIG.grid16.selectionTimeoutMs;
+    while (!menuItem && Date.now() < deadline && typeof window.setTimeout === "function") {
+      await new Promise(resolve => window.setTimeout(resolve, 25));
+      menuItem = findVisibleMultiSelectMenuItem();
+    }
+    if (!menuItem || typeof menuItem.click !== "function") {
+      throw new Error("Jellyfin multi-select action is unavailable");
+    }
+    menuItem.click();
+  }
+
+  async function rollbackGridSelection(ids, cardsById) {
+    for (const id of [...ids].reverse()) {
+      try {
+        if (!getSelectedItems().includes(id)) continue;
+        const card = cardsById.get(id) || getPageCards().find(candidate => candidate.id === id)?.element;
+        if (!card) continue;
+        await toggleCardSelection(card);
+        if (!(await waitForSelectionState(id, false))) {
+          log("selection rollback could not be confirmed", id);
+        }
+      } catch (error) {
+        log("selection rollback failed", errorText(error));
+      }
+    }
+  }
+
+  async function syncGrid16Selection(pageCards, selectedIds, options = {}) {
+    const limit = options.maxItems ?? CONFIG.grid16.maxItems;
+    const plan = planGrid16Targets(pageCards, selectedIds, limit);
+    if (!plan.ok) return plan;
+
+    const cardsById = new Map((Array.isArray(pageCards) ? pageCards : []).map(card => [
+      getCardId(card),
+      typeof card === "string" ? null : card?.element || card,
+    ]));
+    const attemptedIds = [];
+
+    try {
+      for (const id of plan.addedIds) {
+        if (getSelectedItems().includes(id)) continue;
+        const card = cardsById.get(id);
+        if (!card) throw new Error(`Card ${id} is no longer available`);
+
+        attemptedIds.push(id);
+        await toggleCardSelection(card);
+        if (!(await waitForSelectionState(id, true, options.timeoutMs))) {
+          throw new Error(`Could not confirm selection for card ${id}`);
+        }
+      }
+
+      const finalSelected = getSelectedItems();
+      if (plan.targets.some(id => !finalSelected.includes(id))) {
+        throw new Error("Jellyfin selection state could not be confirmed");
+      }
+      return { ...plan, selectedIds: finalSelected, attemptedIds };
+    } catch (error) {
+      await rollbackGridSelection(attemptedIds, cardsById);
+      return {
+        ...plan,
+        ok: false,
+        reason: "selection-sync-failed",
+        error: errorText(error),
+        attemptedIds,
+      };
+    }
+  }
 
   function launchUrl(url) {
-    log("launch ->", url);
-    const iframe = document.createElement('iframe');
-    iframe.style.display = 'none';
+    if (!document.body) throw new Error("Jellyfin page body is unavailable");
+
+    let scheme = "unknown";
+    try {
+      scheme = new URL(url).protocol.replace(":", "");
+    } catch (_error) {
+      scheme = String(url).split(":", 1)[0] || scheme;
+    }
+    log("launch", { scheme });
+
+    const iframe = document.createElement("iframe");
+    iframe.style.display = "none";
     iframe.src = url;
     document.body.appendChild(iframe);
-    setTimeout(() => document.body.removeChild(iframe), 2000);
+    window.setTimeout(() => {
+      try {
+        iframe.remove();
+      } catch (error) {
+        log("iframe cleanup failed", errorText(error));
+      }
+    }, CONFIG.launchCleanupMs);
   }
 
-  async function handlePlay(mode, profile) {
-    const ctx = getContext();
-    let targets = [];
-
-    if (ctx.type === 'detail' && ctx.id) {
-      targets = [ctx.id];
-    } else if (ctx.type === 'selection' && ctx.ids) {
-      targets = ctx.ids;
+  async function resolveTarget(itemId, options = {}) {
+    const item = await getPlayableItem(itemId);
+    const url = getStreamUrl(item);
+    let subtitle = "";
+    try {
+      subtitle = getSubtitleUrl(item, { strict: options.strict === true });
+    } catch (error) {
+      if (options.strict) throw new Error(`Subtitle preparation failed: ${errorText(error)}`);
+      log("subtitle skipped", errorText(error));
     }
-
-    if (targets.length === 0) return;
-
-    const playList = targets.slice(0, 4);
-
-    // === MPV Batch ===
-    if (mode === 'mpv') {
-      const batchPayload = [];
-      for (let i = 0; i < playList.length; i++) {
-        const id = playList[i];
-        const item = await getPlayableItem(id);
-        const url = getStreamUrl(item);
-        if (!url) continue;
-
-        batchPayload.push({
-          mode: 'mpv',
-          url: url,
-          profile: profile,
-          geometry: getGeometry(i, playList.length),
-          title: `Slot ${i+1}: ${item.Name}`,
-          // 【核心更新】注入字幕链接
-          sub: getSubtitleUrl(item) 
-        });
-      }
-      if (batchPayload.length > 0) {
-        launchUrl(buildGenericUrl(batchPayload));
-      }
-      return;
-    }
-
-    // === Legacy Players ===
-    for (let i = 0; i < playList.length; i++) {
-      const id = playList[i];
-      const item = await getPlayableItem(id);
-      const url = getStreamUrl(item);
-      if (!url) continue;
-
-      let finalLink = "";
-      if (mode === 'pot') finalLink = buildPotPlayerNativeUrl(url);
-      else if (mode === 'iina') finalLink = buildIinaUrl(url);
-      else if (mode === 'infuse') finalLink = buildInfuseUrl(url);
-
-      if (playList.length > 1) {
-        setTimeout(() => launchUrl(finalLink), i * 800);
-      } else {
-        launchUrl(finalLink);
-      }
-    }
+    return { item, url, subtitle };
   }
 
-  // =========================
-  // UI Generation
-  // =========================
+  async function resolveTargets(targets, options = {}) {
+    const results = await Promise.all(targets.map(async itemId => {
+      try {
+        return { itemId, value: await resolveTarget(itemId, options) };
+      } catch (error) {
+        return { itemId, error: errorText(error) };
+      }
+    }));
+
+    return {
+      valid: results.filter(result => result.value).map(result => result.value),
+      failed: results.filter(result => result.error),
+    };
+  }
+
+  function reportFailures(failed, launched) {
+    if (!failed.length) return;
+    const prefix = launched > 0 ? `${launched} started; ` : "";
+    const details = failed.slice(0, 3).map(result => `${result.itemId}: ${result.error}`).join("\n");
+    const suffix = failed.length > 3 ? `\n...and ${failed.length - 3} more` : "";
+    showError(`${prefix}${failed.length} item(s) could not be played.\n${details}${suffix}`);
+  }
+
+  function reportStrictFailures(failed, expected) {
+    const details = failed.slice(0, 3).map(result => `${result.itemId}: ${result.error}`).join("\n");
+    const suffix = failed.length > 3 ? `\n...and ${failed.length - 3} more` : "";
+    const detailText = details ? `\n${details}${suffix}` : "";
+    showError(`Grid Play 4x4 requires ${expected} playable items; no MPV windows were started.${detailText}`);
+  }
+
+  function getTargets(context) {
+    if (context.type === "detail" && context.id) return [context.id];
+    if (context.type === "selection" && Array.isArray(context.ids)) return context.ids;
+    return [];
+  }
+
+  function buildMpvPayload(entries, profile, layout = {}) {
+    if (!Array.isArray(entries)) return null;
+    const { columns, rows, maxItems } = getLayoutValues(layout);
+    const strictCount = Number(layout.strictCount || 0);
+    if (!Number.isInteger(columns) || columns < 1 || !Number.isInteger(rows) || rows < 1) return null;
+    if (!Number.isInteger(maxItems) || maxItems < 1 || entries.length > maxItems) return null;
+    if (strictCount > 0 && entries.length !== strictCount) return null;
+
+    return entries.map((entry, index) => ({
+      mode: "mpv",
+      url: entry.url,
+      profile,
+      geometry: getGridGeometry(index, entries.length, columns, rows),
+      title: `Slot ${index + 1}: ${entry.item.Name || "Untitled"}`,
+      sub: entry.subtitle,
+    }));
+  }
+
+  async function handlePlay(mode, profile, options = {}) {
+    const context = getContext();
+    const layout = options.layout || {};
+    const layoutValues = getLayoutValues(layout);
+    const strictCount = Number(options.strictCount ?? layout.strictCount ?? 0);
+    const strict = options.strict === true || strictCount > 0;
+    const requestedTargets = Array.isArray(options.targets) ? options.targets : getTargets(context);
+    const normalizedTargets = uniqueIds(requestedTargets);
+    const expected = strictCount > 0 ? strictCount : normalizedTargets.length;
+
+    if (strict && normalizedTargets.length !== expected) {
+      reportStrictFailures([], expected);
+      return { launched: false, valid: [], failed: [], payload: null };
+    }
+
+    const maxItems = Number(options.maxItems ?? layoutValues.maxItems ?? CONFIG.maxItems);
+    const targets = strict ? normalizedTargets : normalizedTargets.slice(0, maxItems);
+    if (!targets.length) return;
+
+    const { valid, failed } = await resolveTargets(targets, { strict });
+    if (strict && (failed.length > 0 || valid.length !== expected)) {
+      reportStrictFailures(failed, expected);
+      return { launched: false, valid, failed, payload: null };
+    }
+
+    if (!valid.length) {
+      reportFailures(failed, 0);
+      return { launched: false, valid, failed, payload: null };
+    }
+
+    if (mode === "mpv") {
+      const payload = buildMpvPayload(valid, profile, {
+        ...layout,
+        maxItems,
+        strictCount: strict ? expected : 0,
+      });
+      if (!payload) {
+        if (strict) reportStrictFailures([], expected);
+        else showError("MPV payload could not be constructed");
+        return { launched: false, valid, failed, payload: null };
+      }
+      launchUrl(buildGenericUrl(payload));
+      reportFailures(failed, valid.length);
+      return { launched: true, valid, failed, payload };
+    }
+
+    const links = valid.map(entry => {
+      if (mode === "pot") return buildPotPlayerNativeUrl(entry.url);
+      if (mode === "iina") return buildIinaUrl(entry.url);
+      if (mode === "infuse") return buildInfuseUrl(entry.url);
+      throw new Error(`Unsupported player mode: ${mode}`);
+    });
+
+    const launchTasks = links.map((link, index) => new Promise(resolve => {
+      const delay = links.length > 1 ? index * CONFIG.legacyLaunchDelayMs : 0;
+      window.setTimeout(() => {
+        try {
+          launchUrl(link);
+        } catch (error) {
+          showError(`Player launch failed: ${errorText(error)}`);
+        } finally {
+          resolve();
+        }
+      }, delay);
+    }));
+    await Promise.all(launchTasks);
+    reportFailures(failed, links.length);
+    return { launched: links.length > 0, valid, failed, payload: null };
+  }
 
   function ensurePanel() {
     if (document.getElementById(PANEL_ID)) return document.getElementById(PANEL_ID);
@@ -270,7 +717,6 @@
         #${PANEL_ID} .jfp-btn:active { transform: scale(0.96); opacity: 0.9; }
         #${PANEL_ID} .jfp-btn.primary { background: #00a4dc; color: #fff; }
         #${PANEL_ID} .jfp-btn.grid { background: #e0f2f1; color: #00695c; }
-        #${PANEL_ID} .jfp-sep { width: 1px; height: 18px; opacity: .2; background: #fff; margin: 0 4px; }
         #${PANEL_ID} .jfp-info { font-size: 12px; color: #ccc; margin-left: 4px; font-family: sans-serif; pointer-events: none; }
       `;
       document.head.appendChild(style);
@@ -282,84 +728,186 @@
     return panel;
   }
 
-  function renderButtons(panel, ctx) {
+  let playbackInProgress = false;
+  function runWithPlaybackLock(button, action) {
+    if (playbackInProgress || button.disabled) return;
+    playbackInProgress = true;
+    const panel = button.closest(`#${PANEL_ID}`);
+    if (panel) panel.querySelectorAll("button").forEach(control => { control.disabled = true; });
+    Promise.resolve()
+      .then(action)
+      .catch(error => showError(`Playback preparation failed: ${errorText(error)}`))
+      .finally(() => {
+        playbackInProgress = false;
+        if (panel) panel.querySelectorAll("button").forEach(control => { control.disabled = false; });
+      });
+  }
+
+  function bindPlayButton(button, mode, profile, options) {
+    button.onclick = () => runWithPlaybackLock(button, () => handlePlay(mode, profile, options));
+  }
+
+  function reportGrid16SelectionFailure(result) {
+    if (result.reason === "too-many-selected") {
+      showError(`Grid Play 4x4 supports at most ${CONFIG.grid16.maxItems} selected items. Reduce the current selection and try again.`);
+      return;
+    }
+    if (result.reason === "not-enough-page-items") {
+      showError(`Grid Play 4x4 requires ${CONFIG.grid16.maxItems} media cards on the current page; only ${result.pageIds.length} are available.`);
+      return;
+    }
+    showError(`Grid Play 4x4 selection failed: ${result.error || result.reason || "unknown error"}`);
+  }
+
+  async function handleGrid16Play() {
+    const pageCards = getPageCards();
+    const selectedIds = getSelectedItems();
+    const selection = await syncGrid16Selection(pageCards, selectedIds);
+    if (!selection.ok) {
+      reportGrid16SelectionFailure(selection);
+      return { launched: false, selection, payload: null };
+    }
+
+    return handlePlay("mpv", CONFIG.grid16.profile, {
+      targets: selection.targets,
+      strict: true,
+      strictCount: CONFIG.grid16.maxItems,
+      layout: {
+        columns: CONFIG.grid16.columns,
+        rows: CONFIG.grid16.rows,
+        maxItems: CONFIG.grid16.maxItems,
+        strictCount: CONFIG.grid16.maxItems,
+      },
+    });
+  }
+
+  function renderButtons(panel, context) {
     const os = getOS();
     const rule = CONFIG.showOn[os] || CONFIG.showOn.other;
     panel.innerHTML = "";
 
-    if (ctx.type === 'selection') {
-      const count = ctx.ids.length;
-      const btn = document.createElement("button");
-      btn.className = "jfp-btn grid";
-      btn.textContent = count > 1 ? `Grid Play (${Math.min(count, 4)})` : "Play Selected";
-      btn.onclick = () => handlePlay('mpv', 'multi').catch(e => alert(e));
-      panel.appendChild(btn);
-      
+    if (context.type === "selection") {
+      const count = context.ids.length;
+      const button = document.createElement("button");
+      button.className = "jfp-btn grid";
+      button.textContent = count > 1 ? `Grid Play (${Math.min(count, CONFIG.maxItems)})` : "Play Selected";
+      bindPlayButton(button, "mpv", "multi");
+      panel.appendChild(button);
+
       const info = document.createElement("div");
       info.className = "jfp-info";
-      info.textContent = count > 4 ? "(Max 4)" : "MPV";
+      info.textContent = count > CONFIG.maxItems ? `(Max ${CONFIG.maxItems})` : "MPV";
       panel.appendChild(info);
+    }
+
+    if ((context.type === "listing" || context.type === "selection") && context.pageIds?.length) {
+      const grid16 = document.createElement("button");
+      grid16.className = "jfp-btn primary";
+      grid16.textContent = "Grid Play 4x4 (16)";
+      grid16.title = "Play the first 16 media cards on this page in a 4x4 MPV grid";
+      grid16.onclick = () => runWithPlaybackLock(grid16, handleGrid16Play);
+      panel.appendChild(grid16);
       return;
     }
 
-    if (ctx.type === 'detail') {
-      if (rule.mpv) {
-        const btnMulti = document.createElement("button");
-        btnMulti.className = "jfp-btn primary";
-        btnMulti.textContent = "MPV (Multi)";
-        btnMulti.onclick = () => handlePlay('mpv', 'multi');
-        panel.appendChild(btnMulti);
+    if (context.type !== "detail") return;
 
-        const btnCinema = document.createElement("button");
-        btnCinema.className = "jfp-btn";
-        btnCinema.textContent = "MPV (Cinema)";
-        btnCinema.onclick = () => handlePlay('mpv', 'cinema');
-        panel.appendChild(btnCinema);
-      }
-      if (rule.pot) {
-        const btnPot = document.createElement("button");
-        btnPot.className = "jfp-btn";
-        btnPot.textContent = "PotPlayer";
-        btnPot.onclick = () => handlePlay('pot');
-        panel.appendChild(btnPot);
-      }
-      if (rule.iina) {
-        const btn = document.createElement("button");
-        btn.className = "jfp-btn";
-        btn.textContent = "IINA";
-        btn.onclick = () => handlePlay('iina');
-        panel.appendChild(btn);
-      }
-      if (rule.infuse) {
-        const btn = document.createElement("button");
-        btn.className = "jfp-btn";
-        btn.textContent = "Infuse";
-        btn.onclick = () => handlePlay('infuse');
-        panel.appendChild(btn);
-      }
+    if (rule.mpv) {
+      const multi = document.createElement("button");
+      multi.className = "jfp-btn primary";
+      multi.textContent = "MPV (Multi)";
+      bindPlayButton(multi, "mpv", "multi");
+      panel.appendChild(multi);
+
+      const cinema = document.createElement("button");
+      cinema.className = "jfp-btn";
+      cinema.textContent = "MPV (Cinema)";
+      bindPlayButton(cinema, "mpv", "cinema");
+      panel.appendChild(cinema);
     }
+
+    if (rule.pot) {
+      const pot = document.createElement("button");
+      pot.className = "jfp-btn";
+      pot.textContent = "PotPlayer";
+      bindPlayButton(pot, "pot");
+      panel.appendChild(pot);
+    }
+
+    if (rule.iina) {
+      const iina = document.createElement("button");
+      iina.className = "jfp-btn";
+      iina.textContent = "IINA";
+      bindPlayButton(iina, "iina");
+      panel.appendChild(iina);
+    }
+
+    if (rule.infuse) {
+      const infuse = document.createElement("button");
+      infuse.className = "jfp-btn";
+      infuse.textContent = "Infuse";
+      bindPlayButton(infuse, "infuse");
+      panel.appendChild(infuse);
+    }
+  }
+
+  function contextKey(context) {
+    if (context.type === "selection") return `selection:${context.ids.join(",")}|page:${(context.pageIds || []).join(",")}`;
+    if (context.type === "listing") return `listing:${(context.pageIds || []).join(",")}`;
+    return `${context.type}:${context.id || ""}`;
   }
 
   let lastState = "";
   function tick() {
-    const panel = ensurePanel();
-    const ctx = getContext();
-    const currentState = ctx.type + (ctx.ids ? ctx.ids.length + ctx.ids[0] : ctx.id);
+    try {
+      const panel = ensurePanel();
+      const context = getContext();
+      const state = contextKey(context);
 
-    if (currentState !== lastState) {
-      lastState = currentState;
-      log("Context changed:", ctx);
-      if (ctx.type === 'none') {
-        panel.style.display = "none";
-      } else {
-        renderButtons(panel, ctx);
-        panel.style.display = "flex";
+      if (state !== lastState) {
+        lastState = state;
+        log("context changed", context.type);
+        if (context.type === "none") {
+          panel.style.display = "none";
+        } else {
+          renderButtons(panel, context);
+          panel.style.display = "flex";
+        }
       }
+    } catch (error) {
+      log("context polling failed", errorText(error));
     }
-    setTimeout(() => requestAnimationFrame(tick), 200);
+    window.setTimeout(() => window.requestAnimationFrame(tick), 200);
   }
 
-  log("v4.2.0 Subtitles & FullScreen Logic Loaded");
-  tick();
+  if (globalThis.__JFP_TEST__) {
+    globalThis.__JFP_TEST_API__ = {
+      base64Encode,
+      buildGenericUrl,
+      buildPotPlayerNativeUrl,
+      buildIinaUrl,
+      buildInfuseUrl,
+      buildJellyfinUrl,
+      getStreamUrl,
+      getSubtitleUrl,
+      getPageCards,
+      getPageCardIds,
+      getContext,
+      getSelectedItems,
+      planGrid16Targets,
+      getGridGeometry,
+      getGeometry,
+      buildMpvPayload,
+      resolveTarget,
+      resolveTargets,
+      handlePlay,
+      syncGrid16Selection,
+      handleGrid16Play,
+      sanitizeLogText,
+    };
+    return;
+  }
 
+  log("v4.4.0 loaded");
+  tick();
 })();

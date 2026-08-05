@@ -1,46 +1,56 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/sys/windows/registry"
 	"gopkg.in/ini.v1"
 )
 
-// ==========================================
-// 1. 数据结构定义
-// ==========================================
+const (
+	protocolPrefix = "jelly-player://"
+	maxPayloads    = 16
+	launchDelay    = 50 * time.Millisecond
+)
 
-// Payload 兼容单个对象或数组
+var (
+	profilePattern  = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
+	geometryPattern = regexp.MustCompile(`^\d+x\d+[+-]\d+[+-]\d+$`)
+	sensitiveQuery  = regexp.MustCompile(`(?i)(api_key|apikey|access_token|token)=([^&\s]+)`)
+)
+
+// Payload is the stable wire format carried by jelly-player://.
 type Payload struct {
-	Target   string `json:"mode"`               // mpv, potplayer
-	Url      string `json:"url"`                // 视频地址
-	Profile  string `json:"profile,omitempty"`  // MPV: profile 名称
-	Geometry string `json:"geometry,omitempty"` // MPV: 窗口位置 (50%x50%+0+0)
-	Title    string `json:"title,omitempty"`    // 通用: 窗口标题
-	Sub      string `json:"sub,omitempty"`      // 通用: 字幕文件 URL
+	Target   string `json:"mode"`
+	Url      string `json:"url"`
+	Profile  string `json:"profile,omitempty"`
+	Geometry string `json:"geometry,omitempty"`
+	Title    string `json:"title,omitempty"`
+	Sub      string `json:"sub,omitempty"`
 }
 
 type Config struct {
+	ExePath   string
+	ConfigPath string
 	MpvPath   string
 	PotPath   string
 	EnableLog bool
 	LogPath   string
 }
 
-// PlayerHandler 定义构建命令行的函数签名
 type PlayerHandler func(binPath string, p *Payload) *exec.Cmd
-
-// ==========================================
-// 2. 播放器处理器 (可扩展)
-// ==========================================
 
 var Handlers = map[string]PlayerHandler{
 	"mpv":       buildMpvCmd,
@@ -48,7 +58,7 @@ var Handlers = map[string]PlayerHandler{
 }
 
 func buildMpvCmd(binPath string, p *Payload) *exec.Cmd {
-	args := []string{p.Url}
+	args := make([]string, 0, 10)
 
 	if p.Profile != "" {
 		args = append(args, "--profile="+p.Profile)
@@ -63,91 +73,171 @@ func buildMpvCmd(binPath string, p *Payload) *exec.Cmd {
 		args = append(args, "--sub-file="+p.Sub)
 	}
 
+	// Keep the media URL after -- so a malformed or unusual URL cannot become an option.
+	args = append(args, "--", p.Url)
 	return exec.Command(binPath, args...)
 }
 
 func buildPotPlayerCmd(binPath string, p *Payload) *exec.Cmd {
-	// PotPlayer 命令行简单，只传 URL
-	args := []string{p.Url}
-	return exec.Command(binPath, args...)
+	return exec.Command(binPath, p.Url)
 }
 
-// ==========================================
-// 3. 核心逻辑：协议解析与清洗
-// ==========================================
+func isBase64Candidate(value string) bool {
+	if value == "" {
+		return false
+	}
 
-// parsePayload 解析 jelly-player://<Base64> 协议
+	paddingStarted := false
+	paddingCount := 0
+	for index := 0; index < len(value); index++ {
+		char := value[index]
+		switch {
+		case (char >= 'A' && char <= 'Z') || (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') || char == '+' || char == '/' || char == '-' || char == '_':
+			if paddingStarted {
+				return false
+			}
+		case char == '=':
+			paddingStarted = true
+			paddingCount++
+			if paddingCount > 2 {
+				return false
+			}
+		default:
+			// DecodeString ignores CR/LF. Reject all non-Base64 bytes first so
+			// malformed protocol data cannot be silently normalized.
+			return false
+		}
+	}
+	return true
+}
+
+func decodeBase64Payload(raw string) ([]byte, error) {
+	value := raw
+	if value == "" {
+		return nil, fmt.Errorf("empty payload")
+	}
+
+	candidates := []string{value}
+	unescaped, err := url.PathUnescape(value)
+	if err != nil {
+		return nil, fmt.Errorf("invalid URL encoding")
+	}
+	if unescaped != value {
+		candidates = append(candidates, unescaped)
+	}
+
+	encodings := []*base64.Encoding{
+		base64.RawURLEncoding.Strict(),
+		base64.URLEncoding.Strict(),
+		base64.RawStdEncoding.Strict(),
+		base64.StdEncoding.Strict(),
+	}
+	for _, candidate := range candidates {
+		if !isBase64Candidate(candidate) {
+			continue
+		}
+		for _, encoding := range encodings {
+			if decoded, err := encoding.DecodeString(candidate); err == nil {
+				return decoded, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("invalid base64 payload")
+}
+
 func parsePayload(rawURI string) ([]*Payload, error) {
-	prefix := "jelly-player://"
-	if !strings.HasPrefix(rawURI, prefix) {
+	if len(rawURI) < len(protocolPrefix) || !strings.EqualFold(rawURI[:len(protocolPrefix)], protocolPrefix) {
 		return nil, fmt.Errorf("invalid scheme")
 	}
 
-	// Step 1: 暴力清洗 (逻辑修正版)
-	rawStr := strings.TrimPrefix(rawURI, prefix)
-	var cleanBuilder strings.Builder
-	for _, r := range rawStr {
-		switch {
-		// 1. 保留标准字符
-		case (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
-			cleanBuilder.WriteRune(r)
-		
-		// 2. 归一化 '-' -> '+'
-		case r == '-' || r == '+':
-			cleanBuilder.WriteRune('+')
-		
-		// 3. 归一化 '_' -> '/' (这是 JS 发来的有效数据)
-		case r == '_':
-			cleanBuilder.WriteRune('/')
-
-		// 4. 【关键修正】遇到 '/' 直接丢弃
-		// 因为 JS 发送的是 URL-Safe Base64，有效数据里绝对不会有 '/'。
-		// 所以任何 '/' 都是浏览器/系统加的垃圾。
-		case r == '/': 
-			continue
-			
-		// 5. 其他字符丢弃
-		}
-	}
-	cleanStr := cleanBuilder.String()
-
-	// Step 2: 补全 Padding
-	if m := len(cleanStr) % 4; m != 0 {
-		cleanStr += strings.Repeat("=", 4-m)
-	}
-
-	// Step 3: 解码
-	data, err := base64.StdEncoding.DecodeString(cleanStr)
+	data, err := decodeBase64Payload(rawURI[len(protocolPrefix):])
 	if err != nil {
-		return nil, fmt.Errorf("base64 error: %w | Cleaned: %s", err, cleanStr)
+		return nil, err
 	}
 
-	// Step 4: JSON 字符串清洗
-	// 额外把 '?' 也加入清理列表，以防万一
-	jsonStr := strings.TrimSpace(string(data))
-	jsonStr = strings.Trim(jsonStr, "\x00\x0f\n\r\t ?") 
+	jsonData := bytes.TrimSpace(data)
+	if len(jsonData) == 0 {
+		return nil, fmt.Errorf("empty JSON payload")
+	}
 
 	var results []*Payload
-
-	// Step 5: 智能反序列化
-	// 尝试解析为数组
-	if err := json.Unmarshal([]byte(jsonStr), &results); err == nil {
-		return results, nil
+	switch jsonData[0] {
+	case '[':
+		if err := json.Unmarshal(jsonData, &results); err != nil {
+			return nil, fmt.Errorf("invalid JSON array")
+		}
+	case '{':
+		var single Payload
+		if err := json.Unmarshal(jsonData, &single); err != nil {
+			return nil, fmt.Errorf("invalid JSON object")
+		}
+		results = []*Payload{&single}
+	default:
+		return nil, fmt.Errorf("JSON payload must be an object or array")
 	}
 
-	// 尝试解析为单个对象
-	var single Payload
-	if err := json.Unmarshal([]byte(jsonStr), &single); err != nil {
-		return nil, fmt.Errorf("json error: %w | Data: %s", err, jsonStr)
+	if len(results) == 0 {
+		return nil, fmt.Errorf("JSON payload contains no items")
 	}
-	results = append(results, &single)
-	
+	if len(results) > maxPayloads {
+		return nil, fmt.Errorf("JSON payload exceeds %d items", maxPayloads)
+	}
 	return results, nil
 }
 
-// ==========================================
-// 4. 工具函数
-// ==========================================
+func validateHTTPURL(value string, field string) error {
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("%s is missing", field)
+	}
+	if strings.ContainsAny(value, "\r\n") {
+		return fmt.Errorf("%s contains a line break", field)
+	}
+
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Hostname() == "" {
+		return fmt.Errorf("%s is invalid", field)
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return fmt.Errorf("%s must use HTTP or HTTPS", field)
+	}
+	return nil
+}
+
+func validatePayload(p *Payload) error {
+	if p == nil {
+		return fmt.Errorf("payload is null")
+	}
+
+	p.Target = strings.ToLower(strings.TrimSpace(p.Target))
+	if _, ok := Handlers[p.Target]; !ok {
+		return fmt.Errorf("unknown target %q", p.Target)
+	}
+	if err := validateHTTPURL(p.Url, "media URL"); err != nil {
+		return err
+	}
+	if p.Sub != "" {
+		if err := validateHTTPURL(p.Sub, "subtitle URL"); err != nil {
+			return err
+		}
+	}
+	if p.Profile != "" && !profilePattern.MatchString(p.Profile) {
+		return fmt.Errorf("profile is invalid")
+	}
+	if p.Geometry != "" && !geometryPattern.MatchString(p.Geometry) {
+		return fmt.Errorf("geometry is invalid")
+	}
+	if utf8.RuneCountInString(p.Title) > 256 {
+		return fmt.Errorf("title is too long")
+	}
+	if strings.IndexFunc(p.Title, func(r rune) bool {
+		return r < 0x20 || r == 0x7f
+	}) >= 0 {
+		return fmt.Errorf("title contains a control character")
+	}
+	return nil
+}
 
 func iniPathForExe(exe string) string {
 	dir := filepath.Dir(exe)
@@ -155,123 +245,241 @@ func iniPathForExe(exe string) string {
 	return filepath.Join(dir, base+".ini")
 }
 
-func loadConfig() *Config {
-	exe, _ := os.Executable()
-	defaultLog := filepath.Join(filepath.Dir(exe), "mpv-handler.log")
-	cfg := &Config{EnableLog: true, LogPath: defaultLog}
-
-	iniPath := iniPathForExe(exe)
-	f, err := ini.Load(iniPath)
-	if err == nil {
-		secPlayer := f.Section("players")
-		cfg.MpvPath = secPlayer.Key("mpv").String()
-		cfg.PotPath = secPlayer.Key("potplayer").String()
-
-		secConfig := f.Section("config")
-		cfg.EnableLog = secConfig.Key("log").MustBool(true)
-	}
-	return cfg
+func cleanConfiguredPath(value string) string {
+	value = strings.TrimSpace(value)
+	return strings.Trim(value, "\"")
 }
 
-func writeLog(cfg *Config, msg string) {
-	if !cfg.EnableLog {
+func loadConfig() (*Config, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return &Config{EnableLog: true}, fmt.Errorf("cannot locate executable: %w", err)
+	}
+
+	cfg := &Config{
+		ExePath:    exe,
+		ConfigPath: iniPathForExe(exe),
+		EnableLog:  true,
+		LogPath:    filepath.Join(filepath.Dir(exe), "mpv-handler.log"),
+	}
+
+	file, err := ini.Load(cfg.ConfigPath)
+	if err != nil {
+		return cfg, fmt.Errorf("cannot load config %s", cfg.ConfigPath)
+	}
+
+	players := file.Section("players")
+	cfg.MpvPath = cleanConfiguredPath(players.Key("mpv").String())
+	cfg.PotPath = cleanConfiguredPath(players.Key("potplayer").String())
+
+	settings := file.Section("config")
+	logValue := strings.TrimSpace(settings.Key("log").String())
+	if logValue != "" {
+		enabled, err := strconv.ParseBool(logValue)
+		if err != nil {
+			return cfg, fmt.Errorf("invalid log setting in %s", cfg.ConfigPath)
+		}
+		cfg.EnableLog = enabled
+	}
+	return cfg, nil
+}
+
+func sanitizeLogLine(value string) string {
+	value = sensitiveQuery.ReplaceAllString(value, "$1=<redacted>")
+	value = strings.ReplaceAll(value, "\r", "\\r")
+	value = strings.ReplaceAll(value, "\n", "\\n")
+	return value
+}
+
+func writeLog(cfg *Config, message string) {
+	if cfg == nil || !cfg.EnableLog || cfg.LogPath == "" {
 		return
 	}
-	f, err := os.OpenFile(cfg.LogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err == nil {
-		defer f.Close()
-		ts := time.Now().Format("2006-01-02 15:04:05")
-		f.WriteString(fmt.Sprintf("%s | %s\n", ts, msg))
-	}
-}
 
-// ==========================================
-// 5. 注册表安装
-// ==========================================
-
-func install(exePath string) {
-	scheme := "jelly-player"
-	k, _, err := registry.CreateKey(registry.CLASSES_ROOT, scheme, registry.SET_VALUE)
+	file, err := os.OpenFile(cfg.LogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return
 	}
-	defer k.Close()
+	defer file.Close()
 
-	k.SetStringValue("", "URL:Jellyfin Universal Player")
-	k.SetStringValue("URL Protocol", "")
-
-	ik, _, _ := registry.CreateKey(k, "DefaultIcon", registry.SET_VALUE)
-	ik.SetStringValue("", fmt.Sprintf("%s,0", exePath))
-	ik.Close()
-
-	ck, _, _ := registry.CreateKey(k, `shell\open\command`, registry.SET_VALUE)
-	defer ck.Close()
-	ck.SetStringValue("", fmt.Sprintf("\"%s\" \"%%1\"", exePath))
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	_, _ = file.WriteString(fmt.Sprintf("%s | %s\n", timestamp, sanitizeLogLine(message)))
 }
 
-// ==========================================
-// 6. 主程序
-// ==========================================
+func install(exePath string) (err error) {
+	if strings.TrimSpace(exePath) == "" {
+		return fmt.Errorf("executable path is missing")
+	}
+
+	key, _, err := registry.CreateKey(registry.CLASSES_ROOT, "jelly-player", registry.SET_VALUE)
+	if err != nil {
+		return fmt.Errorf("create protocol registry key: %w", err)
+	}
+	defer func() {
+		if closeErr := key.Close(); err == nil && closeErr != nil {
+			err = fmt.Errorf("close protocol registry key: %w", closeErr)
+		}
+	}()
+
+	if err := key.SetStringValue("", "URL:Jellyfin Universal Player"); err != nil {
+		return fmt.Errorf("set protocol description: %w", err)
+	}
+	if err := key.SetStringValue("URL Protocol", ""); err != nil {
+		return fmt.Errorf("set URL Protocol value: %w", err)
+	}
+
+	iconKey, _, err := registry.CreateKey(key, "DefaultIcon", registry.SET_VALUE)
+	if err != nil {
+		return fmt.Errorf("create protocol icon key: %w", err)
+	}
+	defer func() {
+		if closeErr := iconKey.Close(); err == nil && closeErr != nil {
+			err = fmt.Errorf("close protocol icon key: %w", closeErr)
+		}
+	}()
+
+	if err := iconKey.SetStringValue("", fmt.Sprintf("%s,0", exePath)); err != nil {
+		return fmt.Errorf("set protocol icon: %w", err)
+	}
+
+	commandKey, _, err := registry.CreateKey(key, `shell\open\command`, registry.SET_VALUE)
+	if err != nil {
+		return fmt.Errorf("create protocol command key: %w", err)
+	}
+	defer func() {
+		if closeErr := commandKey.Close(); err == nil && closeErr != nil {
+			err = fmt.Errorf("close protocol command key: %w", closeErr)
+		}
+	}()
+	command := fmt.Sprintf("\"%s\" \"%%1\"", exePath)
+	if err := commandKey.SetStringValue("", command); err != nil {
+		return fmt.Errorf("set protocol command: %w", err)
+	}
+	return nil
+}
+
+func playerPath(cfg *Config, target string) string {
+	if cfg == nil {
+		return ""
+	}
+	switch target {
+	case "mpv":
+		return cfg.MpvPath
+	case "potplayer":
+		return cfg.PotPath
+	default:
+		return ""
+	}
+}
+
+func run(args []string, cfg *Config) error {
+	if cfg == nil {
+		return fmt.Errorf("configuration is unavailable")
+	}
+	if len(args) == 0 {
+		return nil
+	}
+	if args[0] == "--install" {
+		if len(args) != 1 {
+			return fmt.Errorf("usage: --install; configure players in %s", cfg.ConfigPath)
+		}
+		return install(cfg.ExePath)
+	}
+	if len(args) != 1 {
+		return fmt.Errorf("unexpected command arguments")
+	}
+
+	payloads, err := parsePayload(args[0])
+	if err != nil {
+		return err
+	}
+
+	started := 0
+	firstFailure := ""
+	recordFailure := func(index int, reason string) {
+		writeLog(cfg, fmt.Sprintf("[%d] %s", index, reason))
+		if firstFailure == "" {
+			firstFailure = fmt.Sprintf("[%d] %s", index, reason)
+		}
+	}
+
+	for index, payload := range payloads {
+		if err := validatePayload(payload); err != nil {
+			recordFailure(index, fmt.Sprintf("Payload rejected: %v", err))
+			continue
+		}
+
+		binPath := playerPath(cfg, payload.Target)
+		if binPath == "" {
+			recordFailure(index, fmt.Sprintf("Player path missing for %s", payload.Target))
+			continue
+		}
+		info, err := os.Stat(binPath)
+		if err != nil {
+			recordFailure(index, fmt.Sprintf("Player path unavailable for %s", payload.Target))
+			continue
+		}
+		if info.IsDir() {
+			recordFailure(index, fmt.Sprintf("Player path is a directory for %s", payload.Target))
+			continue
+		}
+
+		handler, ok := Handlers[payload.Target]
+		if !ok {
+			recordFailure(index, fmt.Sprintf("Handler missing for %s", payload.Target))
+			continue
+		}
+
+		cmd := handler(binPath, payload)
+		if cmd == nil {
+			recordFailure(index, fmt.Sprintf("Handler returned no command for %s", payload.Target))
+			continue
+		}
+		writeLog(cfg, fmt.Sprintf("[%d] Launching %s geometry=%q", index, payload.Target, payload.Geometry))
+		if err := cmd.Start(); err != nil {
+			recordFailure(index, fmt.Sprintf("Start error for %s", payload.Target))
+			continue
+		}
+		started++
+		if cmd.Process != nil {
+			if err := cmd.Process.Release(); err != nil {
+				writeLog(cfg, fmt.Sprintf("[%d] Process handle release failed for %s", index, payload.Target))
+			}
+		}
+		time.Sleep(launchDelay)
+	}
+
+	if started == 0 {
+		if firstFailure != "" {
+			return fmt.Errorf("no player process was started: %s", firstFailure)
+		}
+		return fmt.Errorf("no player process was started")
+	}
+	return nil
+}
+
+func reportError(cfg *Config, err error) {
+	if err == nil {
+		return
+	}
+	message := sanitizeLogLine(err.Error())
+	writeLog(cfg, "Error: "+message)
+	_, _ = fmt.Fprintln(os.Stderr, message)
+}
 
 func main() {
-	exe, _ := os.Executable()
-	cfg := loadConfig()
-
-	// 至少需要一个参数 (URI 或 --install)
 	if len(os.Args) < 2 {
 		return
 	}
 
-	arg := os.Args[1]
-
-	// 安装模式
-	if arg == "--install" {
-		install(exe)
+	cfg, configErr := loadConfig()
+	args := os.Args[1:]
+	if configErr != nil {
+		reportError(cfg, configErr)
 		return
 	}
 
-	// 运行模式
-	payloads, err := parsePayload(arg)
-	if err != nil {
-		writeLog(cfg, "Protocol Error: "+err.Error())
-		return
-	}
-
-	// 批量执行
-	for i, p := range payloads {
-		// 获取播放器路径
-		var binPath string
-		switch p.Target {
-		case "mpv":
-			binPath = cfg.MpvPath
-		case "potplayer":
-			binPath = cfg.PotPath
-		default:
-			writeLog(cfg, fmt.Sprintf("[%d] Unknown Target: %s", i, p.Target))
-			continue
-		}
-
-		if binPath == "" {
-			writeLog(cfg, fmt.Sprintf("[%d] Path missing for: %s", i, p.Target))
-			continue
-		}
-
-		// 构建命令
-		handler, ok := Handlers[p.Target]
-		if !ok {
-			continue
-		}
-
-		cmd := handler(binPath, p)
-		writeLog(cfg, fmt.Sprintf("[%d] Launching: %s | Geo: %s", i, p.Title, p.Geometry))
-
-		// 启动
-		if err := cmd.Start(); err != nil {
-			writeLog(cfg, fmt.Sprintf("[%d] Start Error: %v", i, err))
-		}
-
-		// 微小延迟，防止并发过高瞬间卡死 CPU
-		// 这个延迟用户无感，但对系统稳定性很有帮助
-		time.Sleep(50 * time.Millisecond)
+	if err := run(args, cfg); err != nil {
+		reportError(cfg, err)
 	}
 }

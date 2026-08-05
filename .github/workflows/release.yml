@@ -14,6 +14,44 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    name: Test Windows Handler
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Run Go tests
+        run: go test ./...
+
+      - name: Run Go vet
+        run: go vet ./...
+
+  test-js:
+    name: Test Userscript
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run JavaScript tests
+        run: node --test tests/script.test.mjs
+
+      - name: Check userscript syntax
+        run: node --check script.js
+
   build:
     name: Build Binaries
     runs-on: ubuntu-latest
@@ -45,7 +83,7 @@ jobs:
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: build
+    needs: [test, test-js, build]
     # Only run release if triggered by a tag.
     # If triggered manually (workflow_dispatch), we usually just want the artifacts (Build job),
     # unless you explicitly want to create a release from a manual run.

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Jellyfin External Players (Batch/FullScreen/Subs)
 // @namespace    yifans.tech
-// @version      4.4.3
+// @version      4.4.4
 // @description  Launch MPV, PotPlayer, IINA, and Infuse from Jellyfin, including 4x4 MPV playback.
 // @match        *://*/web/*
 // @grant        none
@@ -470,10 +470,18 @@
 
   function findCardSelectionControl(card) {
     if (!card || typeof card.querySelectorAll !== "function") return null;
-    const controls = card.querySelectorAll(
-      'input.chkItemSelect, input[type="checkbox"], [role="checkbox"], .checkboxOutline',
-    );
-    return Array.from(controls).find(control => (
+    const controls = Array.from(card.querySelectorAll(
+      '.checkboxOutline, [role="checkbox"], input.chkItemSelect, input[type="checkbox"]',
+    )).sort((left, right) => {
+      const priority = control => {
+        if (control.matches?.(".checkboxOutline.multiSelectCheckboxOutline")) return 0;
+        if (control.matches?.(".checkboxOutline")) return 1;
+        if (control.matches?.('[role="checkbox"]')) return 2;
+        return 3;
+      };
+      return priority(left) - priority(right);
+    });
+    return controls.find(control => (
       typeof control.click === "function" && isVisibleElement(control, { allowTransparent: true })
     )) || null;
   }
@@ -994,6 +1002,6 @@
     return;
   }
 
-  log("v4.4.3 loaded");
+  log("v4.4.4 loaded");
   tick();
 })();

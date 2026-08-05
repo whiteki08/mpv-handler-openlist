@@ -336,6 +336,56 @@ test("transparent Jellyfin checkbox controls remain selectable and count as sele
   assert.equal(clickCount, 1);
 });
 
+test("Jellyfin visual checkbox is preferred over the hidden input", async () => {
+  let outlineClicks = 0;
+  let inputClicks = 0;
+  const card = {
+    parentElement: null,
+    getAttribute() {
+      return null;
+    },
+  };
+  const outline = {
+    hidden: false,
+    parentElement: card,
+    getAttribute() {
+      return null;
+    },
+    getBoundingClientRect() {
+      return { width: 27, height: 27 };
+    },
+    matches(selector) {
+      return selector.includes(".checkboxOutline");
+    },
+    click() {
+      outlineClicks += 1;
+    },
+  };
+  const input = {
+    hidden: false,
+    parentElement: card,
+    getAttribute() {
+      return null;
+    },
+    getBoundingClientRect() {
+      return { width: 1, height: 1 };
+    },
+    matches() {
+      return false;
+    },
+    click() {
+      inputClicks += 1;
+    },
+  };
+  card.querySelectorAll = () => [input, outline];
+  const helpers = loadHelpers();
+
+  assert.equal(helpers.findCardSelectionControl(card), outline);
+  await helpers.toggleCardSelection(card);
+  assert.equal(outlineClicks, 1);
+  assert.equal(inputClicks, 0);
+});
+
 test("multi-select toggles Jellyfin's native checkbox when it is available", async () => {
   const helpers = loadHelpers();
   let clickCount = 0;
